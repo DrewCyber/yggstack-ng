@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock is tracked for binaries
+# Cargo.lock
+
+# Editor / OS artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Workspace context scratch file
+context

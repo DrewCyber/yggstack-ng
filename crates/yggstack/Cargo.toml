@@ -1,0 +1,32 @@
+[package]
+name = "yggstack"
+version = "0.1.0"
+edition = "2021"
+description = "Yggdrasil as SOCKS proxy / port forwarder (Rust)"
+
+[[bin]]
+name = "yggstack"
+path = "src/main.rs"
+
+[dependencies]
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "7d46bb04aa54b78cee5e43594ee685d3c750e777" }
+
+smoltcp = { version = "0.11", default-features = false, features = [
+    "medium-ip",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+    "alloc",
+] }
+
+tokio        = { version = "1",   features = ["full"] }
+clap         = { version = "4",   features = ["derive"] }
+serde        = { version = "1",   features = ["derive"] }
+toml         = "0.8"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex          = "0.4"
+rand         = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+crossbeam-channel = "0.5"
+bytes        = "1"
