@@ -1,0 +1,49 @@
+[package]
+name = "yggstack"
+version = "0.1.0"
+edition = "2021"
+description = "Yggdrasil userspace stack – TCP/UDP forwarding and SOCKS5 proxy"
+license = "MPL-2.0"
+
+[[bin]]
+name = "yggstack"
+path = "src/main.rs"
+
+[lib]
+name = "yggstack"
+path = "src/lib.rs"
+
+[dependencies]
+# Yggdrasil-ng core (no TUN)
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Userspace IP/TCP/UDP stack
+smoltcp = { version = "0.11", features = [
+    "medium-ip",
+    "proto-ipv6",
+    "proto-ipv6-fragmentation",
+    "fragmentation-buffer-size-65536",
+    "socket-tcp",
+    "socket-udp",
+    "alloc",
+] }
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"
+
+# Config / CLI
+getopts = "0.2"
+toml  = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"

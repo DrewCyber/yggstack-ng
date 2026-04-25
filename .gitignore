@@ -1,0 +1,12 @@
+# Build output
+target/
+
+# Local test configs (may contain private keys)
+tmp/
+*.toml
+!Cargo.toml
+!crates/**/Cargo.toml
+!.cargo/config.toml
+
+# Development context (local copies of upstream sources)
+context/

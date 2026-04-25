@@ -1,0 +1,103 @@
+namespace yggstack_mobile {
+    /// Generate a new config with fresh random keys (TOML text).
+    string generate_config();
+
+    /// Return the library version string.
+    string get_version();
+};
+
+[Error]
+enum YggstackError {
+    "Config",
+    "Runtime",
+    "Io",
+    "AlreadyRunning",
+    "NotRunning",
+};
+
+// ── Callbacks ─────────────────────────────────────────────────────────────────
+
+callback interface LogCallback {
+    void on_log(string message);
+};
+
+// ── Main interface ────────────────────────────────────────────────────────────
+
+interface YggstackMobile {
+    constructor();
+
+    /// Set a log callback for Android logcat integration.
+    void set_log_callback(LogCallback callback);
+
+    /// Set log level: "error", "warn", "info", "debug", "trace".
+    void set_log_level(string level);
+
+    /// Load TOML configuration from a string.
+    [Throws=YggstackError]
+    void load_config(string toml_config);
+
+    /// Generate and load a brand-new config (useful for first-run).
+    [Throws=YggstackError]
+    void generate_and_load_config();
+
+    /// Return the TOML config currently loaded (or empty string if none).
+    string get_config();
+
+    /// Return the IPv6 address derived from the loaded config's private key.
+    [Throws=YggstackError]
+    string get_address();
+
+    /// Return the IPv6 /64 subnet derived from the loaded config's private key.
+    [Throws=YggstackError]
+    string get_subnet();
+
+    /// Return the hex-encoded public key.
+    [Throws=YggstackError]
+    string get_public_key();
+
+    /// Start the Yggdrasil core + netstack.
+    [Throws=YggstackError]
+    void start();
+
+    /// Stop everything.
+    void stop();
+
+    /// Returns true if the node is currently running.
+    boolean is_running();
+
+    /// Add a peer to a running node without restarting.
+    [Throws=YggstackError]
+    void add_live_peer(string uri);
+
+    /// Remove a peer from a running node without restarting.
+    [Throws=YggstackError]
+    void remove_live_peer(string uri);
+
+    /// Wake all sleeping peer reconnect loops so they retry immediately.
+    void retry_peers_now();
+
+    /// Configure the SOCKS5 proxy address (call before start()).
+    void set_socks(string addr);
+
+    /// Set the DNS nameserver address (call before start()).
+    void set_nameserver(string addr);
+
+    /// Add a local-tcp forwarding spec, e.g. "8080:[addr]:80".
+    [Throws=YggstackError]
+    void add_local_tcp(string spec);
+
+    /// Add a local-udp forwarding spec, e.g. "553:[addr]:53".
+    [Throws=YggstackError]
+    void add_local_udp(string spec);
+
+    /// Add a remote-tcp forwarding spec, e.g. "22" or "2022:22".
+    [Throws=YggstackError]
+    void add_remote_tcp(string spec);
+
+    /// Add a remote-udp forwarding spec.
+    [Throws=YggstackError]
+    void add_remote_udp(string spec);
+
+    /// Remove all configured mappings.
+    void clear_mappings();
+};
