@@ -4,6 +4,12 @@ namespace yggstack_mobile {
 
     /// Return the library version string.
     string get_version();
+
+    /// Measure RTT to a QUIC peer via handshake.
+    /// Returns RTT in milliseconds, or -1 if unsupported / unreachable.
+    /// NOTE: The Rust yggdrasil-ng core does not support QUIC peers;
+    /// this function always returns -1 and exists for API compatibility.
+    i64 check_quic_peer(string uri);
 };
 
 [Error]
@@ -100,4 +106,8 @@ interface YggstackMobile {
 
     /// Remove all configured mappings.
     void clear_mappings();
+
+    /// Return JSON array of connected peer stats, compatible with the
+    /// Android peer details panel. Returns "[]" when not running.
+    string get_peers_json();
 };

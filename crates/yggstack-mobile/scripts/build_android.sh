@@ -42,10 +42,9 @@ for entry in "${ABIS[@]}"; do
 
   cargo ndk \
     --target "$target" \
-    --android-platform "$ANDROID_MIN_SDK" \
-    --manifest-path "$MOBILE_CRATE/Cargo.toml" \
+    --platform "$ANDROID_MIN_SDK" \
     -o "$OUT_DIR/jni" \
-    -- build --release -p yggstack-mobile
+    -- build --release -p yggstack-mobile --manifest-path "$MOBILE_CRATE/Cargo.toml"
 done
 
 # Generate Kotlin bindings

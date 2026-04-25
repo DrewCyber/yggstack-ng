@@ -1,5 +1,6 @@
 //! UniFFI mobile bindings for yggstack.
 use std::sync::{Arc, Mutex, Once};
+use serde_json;
 
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
@@ -70,6 +71,14 @@ pub fn generate_config() -> String {
 
 pub fn get_version() -> String {
     format!("yggstack {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Measure RTT to a QUIC peer.
+/// The Rust yggdrasil-ng core does not support QUIC connections, so this
+/// always returns -1 (unknown/unsupported). It exists for API compatibility
+/// with the Android app's public peer browser.
+pub fn check_quic_peer(_uri: String) -> i64 {
+    -1
 }
 
 // ── Running node state ────────────────────────────────────────────────────────
@@ -340,5 +349,40 @@ impl YggstackMobile {
         if let Some(core) = core {
             self.rt.block_on(core.retry_peers_now());
         }
+    }
+
+    /// Return a JSON array of connected peer stats compatible with the Android
+    /// peer details panel. Each object has the fields:
+    ///   URI, Up, Inbound, Port, Priority, Cost, RXBytes, TXBytes,
+    ///   Uptime (nanoseconds), Latency (nanoseconds)
+    /// Returns "[]" when the node is not running.
+    pub fn get_peers_json(&self) -> String {
+        let core = {
+            let guard = self.state.lock().unwrap();
+            guard.as_ref().map(|n| n.core.clone())
+        };
+        let Some(core) = core else {
+            return "[]".to_string();
+        };
+        let peers = self.rt.block_on(core.get_peers());
+        let items: Vec<String> = peers
+            .iter()
+            .map(|p| {
+                let uri_json =
+                    serde_json::to_string(&p.uri).unwrap_or_else(|_| "\"\"".to_string());
+                format!(
+                    r#"{{"URI":{uri},"Up":{up},"Inbound":{inbound},"Port":0,"Priority":0,"Cost":{cost},"RXBytes":{rx},"TXBytes":{tx},"Uptime":{uptime:.0},"Latency":{latency:.0}}}"#,
+                    uri = uri_json,
+                    up = p.up,
+                    inbound = p.inbound,
+                    cost = p.cost,
+                    rx = p.rx_bytes,
+                    tx = p.tx_bytes,
+                    uptime = p.uptime_secs * 1_000_000_000.0,
+                    latency = p.latency_ms * 1_000_000.0,
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
     }
 }

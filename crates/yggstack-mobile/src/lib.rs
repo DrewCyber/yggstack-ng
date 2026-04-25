@@ -8,4 +8,5 @@ pub use mobile::{
     LogCallback,
     generate_config,
     get_version,
+    check_quic_peer,
 };
