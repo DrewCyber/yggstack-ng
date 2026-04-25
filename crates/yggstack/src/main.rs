@@ -197,7 +197,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     core.start().await;
 
     let mtu = core.mtu();
-    let rwc = ReadWriteCloser::new(core.clone(), mtu);
+    let rwc = ReadWriteCloser::new(
+        core.clone(),
+        mtu,
+        #[cfg(feature = "ckr")]
+        Some(&cfg.tunnel_routing),
+    );
     core.set_path_notify(rwc.clone());
 
     let our_addr = config::addr_for_key(&public_key);
@@ -208,7 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Create netstack ───────────────────────────────────────────────────────
 
-    let netstack = YggNetstack::new(rwc.clone(), our_addr, mtu);
+    let netstack = YggNetstack::new(
+        rwc.clone(),
+        our_addr,
+        mtu,
+        #[cfg(feature = "ckr")]
+        Some(&cfg.tunnel_routing),
+    );
 
     // ── Resolver ──────────────────────────────────────────────────────────────
 

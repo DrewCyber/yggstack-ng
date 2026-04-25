@@ -15,9 +15,13 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 test = false
 
+[features]
+default = ["ckr"]
+ckr = []
+
 [dependencies]
-yggstack   = { path = "../yggstack" }
-yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false }
+yggstack   = { path = "../yggstack", features = ["ckr"] }
+yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false, features = ["ckr"] }
 
 tokio      = { version = "1", features = ["full"] }
 uniffi     = { version = "0.29", features = ["build", "cli"] }

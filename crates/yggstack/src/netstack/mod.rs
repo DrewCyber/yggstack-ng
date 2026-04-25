@@ -12,6 +12,8 @@ use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv6Address, Ipv6Cidr};
+#[cfg(feature = "ckr")]
+use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 
@@ -170,7 +172,12 @@ impl YggNetstack {
     /// Create a netstack backed by the given `ReadWriteCloser` and start
     /// background tasks.  `our_addr` is our Yggdrasil IPv6 address and `mtu`
     /// is the transport MTU (from `Core::mtu()`).
-    pub fn new(rwc: Arc<ReadWriteCloser>, our_addr: Ipv6Addr, mtu: u64) -> Arc<Self> {
+    pub fn new(
+        rwc: Arc<ReadWriteCloser>,
+        our_addr: Ipv6Addr,
+        mtu: u64,
+        #[cfg(feature = "ckr")] ckr_config: Option<&yggdrasil::config::TunnelRoutingConfig>,
+    ) -> Arc<Self> {
         let mtu = (mtu as usize).min(65535);
 
         let mut device = YggDevice::new(mtu);
@@ -193,6 +200,23 @@ impl YggNetstack {
             .routes_mut()
             .add_default_ipv6_route(ip6)
             .expect("failed to add default route");
+
+        // CKR: if an IPv4 address is configured, assign it and add a default route.
+        #[cfg(feature = "ckr")]
+        if let Some(ckr) = ckr_config.filter(|c| c.enable && !c.ipv4_address.is_empty()) {
+            if let Some((ip4, prefix)) = parse_ipv4_cidr(&ckr.ipv4_address) {
+                iface.update_ip_addrs(|addrs| {
+                    let _ = addrs.push(IpCidr::Ipv4(Ipv4Cidr::new(ip4, prefix)));
+                });
+                iface
+                    .routes_mut()
+                    .add_default_ipv4_route(ip4)
+                    .expect("failed to add default IPv4 route");
+                tracing::info!("CKR: assigned IPv4 address {}", ckr.ipv4_address);
+            } else {
+                tracing::warn!("CKR: could not parse ipv4_address '{}'", ckr.ipv4_address);
+            }
+        }
 
         let state = Arc::new(Mutex::new(NetstackState {
             iface,
@@ -297,10 +321,21 @@ impl YggNetstack {
 
     // ── Public dial / listen API ──────────────────────────────────────────────
 
-    /// Dial a TCP connection to a remote Yggdrasil address.
+    /// Dial a TCP connection to a remote address.
+    /// For Yggdrasil-only builds accepts IPv6 only; with the `ckr` feature
+    /// also accepts IPv4 (routed via Crypto-Key Routing).
     pub async fn dial_tcp(&self, remote: SocketAddr) -> io::Result<TcpStream> {
-        let remote_ip = match remote {
-            SocketAddr::V6(a) => Ipv6Address::from_bytes(&a.ip().octets()),
+        let remote_ep = match remote {
+            SocketAddr::V6(a) => {
+                let ip6 = Ipv6Address::from_bytes(&a.ip().octets());
+                IpEndpoint::new(IpAddress::Ipv6(ip6), a.port())
+            }
+            #[cfg(feature = "ckr")]
+            SocketAddr::V4(a) => {
+                let ip4 = Ipv4Address::from_bytes(&a.ip().octets());
+                IpEndpoint::new(IpAddress::Ipv4(ip4), a.port())
+            }
+            #[cfg(not(feature = "ckr"))]
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -308,7 +343,6 @@ impl YggNetstack {
                 ))
             }
         };
-        let remote_ep = IpEndpoint::new(IpAddress::Ipv6(remote_ip), remote.port());
 
         // Pick a random local ephemeral port.
         let local_port: u16 = rand::random::<u16>() % 16384 + 49152;
@@ -693,4 +727,16 @@ impl Drop for UdpSocket {
             s.sockets.remove(self.handle);
         }
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Parse an IPv4 CIDR string like "10.99.0.1/24" into a smoltcp address +
+/// prefix length.  Returns `None` on any parse error.
+#[cfg(feature = "ckr")]
+fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Address, u8)> {
+    let (addr_str, prefix_str) = cidr.split_once('/')?;
+    let addr: std::net::Ipv4Addr = addr_str.trim().parse().ok()?;
+    let prefix: u8 = prefix_str.trim().parse().ok()?;
+    Some((Ipv4Address::from_bytes(&addr.octets()), prefix))
 }

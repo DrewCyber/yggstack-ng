@@ -222,14 +222,27 @@ impl YggstackMobile {
         let node = self.rt.block_on(async {
             let pk = signing_key.verifying_key().to_bytes();
             let our_addr = config::addr_for_key(&pk);
+            #[cfg(feature = "ckr")]
+            let tunnel_routing = cfg.tunnel_routing.clone();
             let core = Core::new(signing_key, cfg);
             core.init_links().await;
             core.start().await;
             let mtu = core.mtu();
-            let rwc = ReadWriteCloser::new(core.clone(), mtu);
+            let rwc = ReadWriteCloser::new(
+                core.clone(),
+                mtu,
+                #[cfg(feature = "ckr")]
+                Some(&tunnel_routing),
+            );
             core.set_path_notify(rwc.clone());
 
-            let netstack = YggNetstack::new(rwc.clone(), our_addr, mtu);
+            let netstack = YggNetstack::new(
+                rwc.clone(),
+                our_addr,
+                mtu,
+                #[cfg(feature = "ckr")]
+                Some(&tunnel_routing),
+            );
 
             let resolver = Arc::new(NameResolver::new(netstack.clone(), &nameserver));
 

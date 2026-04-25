@@ -13,9 +13,14 @@ path = "src/main.rs"
 name = "yggstack"
 path = "src/lib.rs"
 
+[features]
+default = ["ckr"]
+# Enables Crypto-Key Routing: IPv4/non-Ygg IPv6 tunneling via remote_subnets.
+ckr = []
+
 [dependencies]
-# Yggdrasil-ng core (no TUN)
-yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false }
+# Yggdrasil-ng core (no TUN, with CKR)
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false, features = ["ckr"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -23,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 # Userspace IP/TCP/UDP stack
 smoltcp = { version = "0.11", features = [
     "medium-ip",
+    "proto-ipv4",
     "proto-ipv6",
     "proto-ipv6-fragmentation",
     "fragmentation-buffer-size-65536",
