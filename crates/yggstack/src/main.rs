@@ -8,6 +8,10 @@ use yggdrasil::admin::AdminSocket;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 
+#[cfg(feature = "dhat-profiling")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use yggstack::config;
 use yggstack::forward::tcp::{spawn_local_tcp, spawn_remote_tcp};
 use yggstack::forward::udp::{spawn_local_udp, spawn_remote_udp};
@@ -18,6 +22,9 @@ use yggstack::socks::Socks5Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "dhat-profiling")]
+    let _profiler = dhat::Profiler::builder().file_name("/data/data/com.termux/files/home/dhat-heap.json").build();
+
     let args: Vec<String> = std::env::args().collect();
 
     let mut opts = Options::new();
@@ -273,10 +280,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Wait for Ctrl-C ───────────────────────────────────────────────────────
 
-    tracing::info!("yggstack running; press Ctrl-C to exit");
-    tokio::signal::ctrl_c().await?;
+    tracing::info!("yggstack running; press Ctrl-C or send SIGTERM to exit");
+
+    // Wait for either SIGINT (Ctrl-C) or SIGTERM (sv stop / kill)
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
     tracing::info!("Shutting down");
 
+    // DHAT profiler (if enabled) will write dhat-heap.json on drop here
     Ok(())
 }
 

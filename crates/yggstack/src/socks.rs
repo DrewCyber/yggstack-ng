@@ -210,11 +210,12 @@ impl Socks5Server {
 
                 let payload = &buf[hdr_len..n];
 
-                // Send through Yggdrasil netstack
+                // Send through Yggdrasil netstack (one per packet — TODO: reuse)
+                tracing::debug!("UDP ASSOCIATE: opening udp socket for {:?}", dest);
                 let ygg_udp = match netstack.open_udp() {
                     Ok(u) => u,
                     Err(e) => {
-                        tracing::debug!("UDP ASSOCIATE open_udp failed: {}", e);
+                        tracing::warn!("UDP ASSOCIATE open_udp failed: {}", e);
                         continue;
                     }
                 };
@@ -250,8 +251,9 @@ impl Socks5Server {
         // Keep TCP control channel open. When it closes, stop the relay.
         let mut discard = [0u8; 1];
         let _ = client.read(&mut discard).await; // blocks until EOF/error
-        tracing::debug!("SOCKS5 UDP ASSOCIATE control channel closed");
+        tracing::debug!("SOCKS5 UDP ASSOCIATE control channel closed, aborting relay");
         relay_task.abort();
+        // ygg_udp sockets created inside relay_task should be dropped when task aborts
         Ok(())
     }
 }
