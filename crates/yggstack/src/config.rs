@@ -34,7 +34,7 @@ pub fn load_file(path: &Path) -> Result<Config, String> {
     let mut cfg: Config = toml::from_str(&text)
         .map_err(|e| format!("TOML parse error: {}", e))?;
     cfg.if_name = "none".to_string();
-    cfg.admin_listen = "none".to_string();
+    // admin_listen is kept from config (e.g. "tcp://127.0.0.1:9001")
     Ok(cfg)
 }
 
@@ -47,7 +47,7 @@ pub fn load_stdin() -> Result<Config, String> {
     let mut cfg: Config = toml::from_str(&text)
         .map_err(|e| format!("TOML parse error: {}", e))?;
     cfg.if_name = "none".to_string();
-    cfg.admin_listen = "none".to_string();
+    // admin_listen is kept from config
     Ok(cfg)
 }
 

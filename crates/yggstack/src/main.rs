@@ -4,6 +4,7 @@ use std::sync::Arc;
 use getopts::Options;
 use tracing_subscriber::EnvFilter;
 
+use yggdrasil::admin::AdminSocket;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 
@@ -195,6 +196,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core = Core::new(signing_key, cfg.clone());
     core.init_links().await;
     core.start().await;
+
+    // Start admin socket (if configured in config, e.g. "tcp://127.0.0.1:9001")
+    let _admin = match AdminSocket::new(&cfg.admin_listen, core.clone()).await {
+        Ok(admin) => Some(admin),
+        Err(e) => {
+            tracing::warn!("Failed to start admin socket: {}", e);
+            None
+        }
+    };
 
     let mtu = core.mtu();
     let rwc = ReadWriteCloser::new(
