@@ -62,8 +62,8 @@ fn spawn_eviction_timer<S: Send + Sync + 'static>(
 
             if evicted > 0 {
                 tracing::info!(
-                    "{}: evicted {} sessions (aborted {} listeners), {} remaining",
-                    label, evicted, aborted, remaining
+                    "[b{}] {}: evicted {} sessions (aborted {} listeners), {} remaining",
+                    crate::BUILD_NUM, label, evicted, aborted, remaining
                 );
             }
         }
@@ -95,53 +95,49 @@ pub fn spawn_local_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
         spawn_eviction_timer(sessions.clone(), "local-udp");
 
         let mut buf = vec![0u8; 65535];
+        let target = mapping.target;
         loop {
             match local_sock.recv_from(&mut buf).await {
                 Ok((n, from)) => {
-                    let data = buf[..n].to_vec();
-                    let target = mapping.target;
-                    let ns = netstack.clone();
-                    let sessions2 = sessions.clone();
-                    let local_sock2 = local_sock.clone();
-
-                    tokio::spawn(async move {
-                        let (udp_sock, need_listener) = {
-                            let mut guard = sessions2.lock().await;
-                            let session = guard.entry(from).or_insert_with(|| {
-                                UdpSession {
-                                    socket: Arc::new(ns.open_udp().unwrap()),
-                                    last_active: Instant::now(),
-                                    listener_handle: None,
-                                }
-                            });
-                            session.last_active = Instant::now();
-                            let need = session.listener_handle
-                                .as_ref()
-                                .map_or(true, |h| h.is_finished());
-                            (session.socket.clone(), need)
-                        };
-
-                        if let Err(e) = udp_sock.send_to(&data, target).await {
-                            tracing::debug!("local-udp send: {}", e);
-                            return;
-                        }
-
-                        if need_listener {
-                            let udp_sock2 = udp_sock.clone();
-                            let from2 = from;
-                            let handle = tokio::spawn(async move {
-                                let mut rbuf = vec![0u8; 65535];
-                                while let Ok((rn, _src)) = udp_sock2.recv_from(&mut rbuf).await {
-                                    let _ = local_sock2.send_to(&rbuf[..rn], from2).await;
-                                }
-                            });
-                            // Store handle for abort on eviction
-                            let mut guard = sessions2.lock().await;
-                            if let Some(session) = guard.get_mut(&from) {
-                                session.listener_handle = Some(handle);
+                    let (udp_sock, need_listener) = {
+                        let mut guard = sessions.lock().await;
+                        let session = guard.entry(from).or_insert_with(|| {
+                            UdpSession {
+                                socket: Arc::new(netstack.open_udp().unwrap()),
+                                last_active: Instant::now(),
+                                listener_handle: None,
                             }
+                        });
+                        session.last_active = Instant::now();
+                        let need = session.listener_handle
+                            .as_ref()
+                            .map_or(true, |h| h.is_finished());
+                        (session.socket.clone(), need)
+                    };
+
+                    if let Err(e) = udp_sock.send_to(&buf[..n], target).await {
+                        tracing::debug!("local-udp send: {}", e);
+                        continue;
+                    }
+
+                    if need_listener {
+                        let udp_sock2 = udp_sock.clone();
+                        let local_sock2 = local_sock.clone();
+                        let from2 = from;
+                        let sessions2 = sessions.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut rbuf = vec![0u8; 65535];
+                            while let Ok((rn, _src)) = udp_sock2.recv_from(&mut rbuf).await {
+                                let _ = local_sock2.send_to(&rbuf[..rn], from2).await;
+                            }
+                        });
+                        let mut guard = sessions.lock().await;
+                        if let Some(session) = guard.get_mut(&from) {
+                            session.listener_handle = Some(handle);
                         }
-                    });
+                    }
+                    // udp_sock Arc drops here — only listener holds a ref
+                    drop(udp_sock);
                 }
                 Err(e) => tracing::warn!("local-udp recv: {}", e),
             }
@@ -177,53 +173,49 @@ pub fn spawn_remote_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
         loop {
             match ygg_sock.recv_from(&mut buf).await {
                 Ok((n, from_ygg)) => {
-                    let data = buf[..n].to_vec();
-                    let ygg_sock2 = ygg_sock.clone();
-                    let sessions2 = sessions.clone();
-
-                    tokio::spawn(async move {
-                        let (local_sock, need_listener) = {
-                            let mut guard = sessions2.lock().await;
-                            if !guard.contains_key(&from_ygg) {
-                                match OsUdpSocket::bind("0.0.0.0:0").await {
-                                    Ok(s) => {
-                                        guard.insert(from_ygg, UdpSession {
-                                            socket: Arc::new(s),
-                                            last_active: Instant::now(),
-                                            listener_handle: None,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("remote-udp local bind: {}", e);
-                                        return;
-                                    }
+                    let (local_sock, need_listener) = {
+                        let mut guard = sessions.lock().await;
+                        if !guard.contains_key(&from_ygg) {
+                            match OsUdpSocket::bind("0.0.0.0:0").await {
+                                Ok(s) => {
+                                    guard.insert(from_ygg, UdpSession {
+                                        socket: Arc::new(s),
+                                        last_active: Instant::now(),
+                                        listener_handle: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("remote-udp local bind: {}", e);
+                                    continue;
                                 }
                             }
-                            let session = guard.get_mut(&from_ygg).unwrap();
-                            session.last_active = Instant::now();
-                            let need = session.listener_handle
-                                .as_ref()
-                                .map_or(true, |h| h.is_finished());
-                            (session.socket.clone(), need)
-                        };
-
-                        if let Err(e) = local_sock.send_to(&data, target).await {
-                            tracing::debug!("remote-udp local send: {}", e);
                         }
+                        let session = guard.get_mut(&from_ygg).unwrap();
+                        session.last_active = Instant::now();
+                        let need = session.listener_handle
+                            .as_ref()
+                            .map_or(true, |h| h.is_finished());
+                        (session.socket.clone(), need)
+                    };
 
-                        if need_listener {
-                            let handle = tokio::spawn(async move {
-                                let mut rbuf = vec![0u8; 65535];
-                                while let Ok((rn, _src)) = local_sock.recv_from(&mut rbuf).await {
-                                    let _ = ygg_sock2.send_to(&rbuf[..rn], from_ygg).await;
-                                }
-                            });
-                            let mut guard = sessions2.lock().await;
-                            if let Some(session) = guard.get_mut(&from_ygg) {
-                                session.listener_handle = Some(handle);
+                    if let Err(e) = local_sock.send_to(&buf[..n], target).await {
+                        tracing::debug!("remote-udp local send: {}", e);
+                    }
+
+                    if need_listener {
+                        let ygg_sock2 = ygg_sock.clone();
+                        let sessions2 = sessions.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut rbuf = vec![0u8; 65535];
+                            while let Ok((rn, _src)) = local_sock.recv_from(&mut rbuf).await {
+                                let _ = ygg_sock2.send_to(&rbuf[..rn], from_ygg).await;
                             }
+                        });
+                        let mut guard = sessions.lock().await;
+                        if let Some(session) = guard.get_mut(&from_ygg) {
+                            session.listener_handle = Some(handle);
                         }
-                    });
+                    }
                 }
                 Err(e) => tracing::warn!("remote-udp recv: {}", e),
             }

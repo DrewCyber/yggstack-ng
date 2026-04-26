@@ -20,6 +20,8 @@ use yggstack::netstack::YggNetstack;
 use yggstack::resolver::NameResolver;
 use yggstack::socks::Socks5Server;
 
+use yggstack::BUILD_NUM;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-profiling")]
@@ -280,7 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Wait for Ctrl-C ───────────────────────────────────────────────────────
 
-    tracing::info!("yggstack running; press Ctrl-C or send SIGTERM to exit");
+    tracing::info!("yggstack running (build #{}); press Ctrl-C or send SIGTERM to exit", BUILD_NUM);
 
     // Wait for either SIGINT (Ctrl-C) or SIGTERM (sv stop / kill)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

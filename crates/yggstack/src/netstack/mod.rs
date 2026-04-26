@@ -112,8 +112,8 @@ impl NetstackState {
                 .map(|pages| pages * 4096 / 1024 / 1024)
                 .unwrap_or(0);
             tracing::info!(
-                "netstack: rss={}MB tcp={} udp={} rx_q={} tx_q={} wakers={}",
-                rss_mb, tcp_count, udp_count,
+                "[b{}] netstack: rss={}MB tcp={} udp={} rx_q={} tx_q={} wakers={}",
+                crate::BUILD_NUM, rss_mb, tcp_count, udp_count,
                 self.device.rx_queue.len(), tx.len(),
                 wakers.len(),
             );
