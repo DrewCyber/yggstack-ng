@@ -111,7 +111,7 @@ pub fn spawn_local_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
                         session.last_active = Instant::now();
                         let need = session.listener_handle
                             .as_ref()
-                            .map_or(true, |h| h.is_finished());
+                            .is_none_or(|h| h.is_finished());
                         (session.socket.clone(), need)
                     };
 
@@ -124,7 +124,6 @@ pub fn spawn_local_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
                         let udp_sock2 = udp_sock.clone();
                         let local_sock2 = local_sock.clone();
                         let from2 = from;
-                        let sessions2 = sessions.clone();
                         let handle = tokio::spawn(async move {
                             let mut rbuf = vec![0u8; 65535];
                             while let Ok((rn, _src)) = udp_sock2.recv_from(&mut rbuf).await {
@@ -175,10 +174,11 @@ pub fn spawn_remote_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
                 Ok((n, from_ygg)) => {
                     let (local_sock, need_listener) = {
                         let mut guard = sessions.lock().await;
-                        if !guard.contains_key(&from_ygg) {
+                        // Ensure a session exists for this remote peer
+                        if let std::collections::hash_map::Entry::Vacant(e) = guard.entry(from_ygg) {
                             match OsUdpSocket::bind("0.0.0.0:0").await {
                                 Ok(s) => {
-                                    guard.insert(from_ygg, UdpSession {
+                                    e.insert(UdpSession {
                                         socket: Arc::new(s),
                                         last_active: Instant::now(),
                                         listener_handle: None,
@@ -194,7 +194,7 @@ pub fn spawn_remote_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
                         session.last_active = Instant::now();
                         let need = session.listener_handle
                             .as_ref()
-                            .map_or(true, |h| h.is_finished());
+                            .is_none_or(|h| h.is_finished());
                         (session.socket.clone(), need)
                     };
 
@@ -204,7 +204,6 @@ pub fn spawn_remote_udp(netstack: Arc<YggNetstack>, mapping: UdpMapping) {
 
                     if need_listener {
                         let ygg_sock2 = ygg_sock.clone();
-                        let sessions2 = sessions.clone();
                         let handle = tokio::spawn(async move {
                             let mut rbuf = vec![0u8; 65535];
                             while let Ok((rn, _src)) = local_sock.recv_from(&mut rbuf).await {

@@ -285,10 +285,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("yggstack running (build #{}); press Ctrl-C or send SIGTERM to exit", BUILD_NUM);
 
     // Wait for either SIGINT (Ctrl-C) or SIGTERM (sv stop / kill)
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = sigterm.recv() => {},
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
     }
     tracing::info!("Shutting down");
 

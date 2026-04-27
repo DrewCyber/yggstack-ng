@@ -95,7 +95,7 @@ impl NetstackState {
         let tx: Vec<Vec<u8>> = self.device.tx_queue.drain(..).collect();
         let wakers: Vec<Waker> = std::mem::take(&mut self.wakers);
         // Periodic stats: every 500 polls (~5 sec)
-        if POLL_COUNT.fetch_add(1, Ordering::Relaxed) % 500 == 0 {
+        if POLL_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(500) {
             let mut tcp_count = 0u32;
             let mut udp_count = 0u32;
             for (_, socket) in self.sockets.iter() {
@@ -181,35 +181,6 @@ impl NetstackState {
         }
     }
 
-    /// Remove TCP sockets that are fully closed (state Closed or TimeWait).
-    /// This frees 128 KB of buffers per socket.
-    fn gc_closed_tcp(&mut self) {
-        // Collect listener handles so we don't remove them.
-        let listener_handles: Vec<SocketHandle> = self
-            .listeners
-            .iter()
-            .flat_map(|e| {
-                let mut v = vec![e.listen_handle];
-                v.extend(e.accept_queue.iter().cloned());
-                v
-            })
-            .collect();
-
-        let mut to_remove = Vec::new();
-        for (handle, socket) in self.sockets.iter() {
-            if listener_handles.contains(&handle) {
-                continue;
-            }
-            if let Socket::Tcp(tcp_socket) = socket {
-                if matches!(tcp_socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
-                    to_remove.push(handle);
-                }
-            }
-        }
-        for handle in to_remove {
-            self.sockets.remove(handle);
-        }
-    }
 }
 
 // ── YggNetstack ───────────────────────────────────────────────────────────────
