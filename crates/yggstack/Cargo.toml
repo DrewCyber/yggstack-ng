@@ -17,6 +17,8 @@ path = "src/lib.rs"
 default = ["ckr"]
 # Enables Crypto-Key Routing: IPv4/non-Ygg IPv6 tunneling via remote_subnets.
 ckr = []
+# Memory profiling with DHAT
+dhat-profiling = ["dep:dhat"]
 
 [dependencies]
 # Yggdrasil-ng core (no TUN, with CKR)
@@ -53,3 +55,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 thiserror = "2"
+
+# Memory profiling (optional)
+dhat = { version = "0.3", optional = true }

@@ -5,11 +5,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{tcp, udp, Socket};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv6Address, Ipv6Cidr};
 #[cfg(feature = "ckr")]
@@ -82,9 +83,8 @@ impl NetstackState {
     /// Also services listeners and drains wakers (caller must fire them after
     /// releasing the lock).
     fn run_poll(&mut self) -> (Vec<Vec<u8>>, Vec<Waker>) {
+        static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
         let now = smoltcp_now();
-        // Loop: smoltcp may only consume one packet per poll() call (e.g. when
-        // buffering IPv6 fragments), so keep polling until rx_queue is empty.
         loop {
             self.iface.poll(now, &mut self.device, &mut self.sockets);
             if self.device.rx_queue.is_empty() {
@@ -94,6 +94,30 @@ impl NetstackState {
         self.service_listeners();
         let tx: Vec<Vec<u8>> = self.device.tx_queue.drain(..).collect();
         let wakers: Vec<Waker> = std::mem::take(&mut self.wakers);
+        // Periodic stats: every 500 polls (~5 sec)
+        if POLL_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(500) {
+            let mut tcp_count = 0u32;
+            let mut udp_count = 0u32;
+            for (_, socket) in self.sockets.iter() {
+                match socket {
+                    Socket::Tcp(_) => tcp_count += 1,
+                    Socket::Udp(_) => udp_count += 1,
+                    _ => {}
+                }
+            }
+            // Read RSS from /proc/self/statm (pages, page_size=4096)
+            let rss_mb = std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map(|pages| pages * 4096 / 1024 / 1024)
+                .unwrap_or(0);
+            tracing::info!(
+                "[b{}] netstack: rss={}MB tcp={} udp={} rx_q={} tx_q={} wakers={}",
+                crate::BUILD_NUM, rss_mb, tcp_count, udp_count,
+                self.device.rx_queue.len(), tx.len(),
+                wakers.len(),
+            );
+        }
         (tx, wakers)
     }
 
@@ -156,6 +180,7 @@ impl NetstackState {
             }
         }
     }
+
 }
 
 // ── YggNetstack ───────────────────────────────────────────────────────────────
@@ -515,7 +540,10 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         if let Ok(mut s) = self.state.lock() {
             let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
-            sock.close();
+            sock.abort();
+            let socket_count = s.sockets.iter().count();
+            s.sockets.remove(self.handle);
+            tracing::debug!("TcpStream dropped, sockets remaining: {}", socket_count - 1);
         }
         self.poll_wakeup.notify_one();
     }
@@ -547,13 +575,8 @@ impl AsyncRead for TcpStream {
             }
         }
 
-        let state = sock.state();
-        if matches!(
-            state,
-            tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
-        ) && !sock.can_recv()
-        {
-            return Poll::Ready(Ok(())); // EOF
+        if !sock.may_recv() {
+            return Poll::Ready(Ok(())); // EOF — covers all closing/closed states
         }
 
         s.wakers.push(cx.waker().clone());
