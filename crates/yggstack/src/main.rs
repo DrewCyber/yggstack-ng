@@ -218,6 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let resolver = Arc::new(NameResolver::new(netstack.clone(), &nameserver));
 
+    // ── Port forwarders ───────────────────────────────────────────────────────
+
+    let (stop_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // ── SOCKS5 server ─────────────────────────────────────────────────────────
 
     if let Some(socks_addr) = matches.opt_str("socks") {
@@ -228,26 +232,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let server = Arc::new(Socks5Server::new(netstack.clone(), resolver.clone()));
         let addr2 = addr.clone();
+        let stop_clone = stop_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = server.serve_tcp(&addr2).await {
+            if let Err(e) = server.serve_tcp(&addr2, stop_clone).await {
                 tracing::error!("SOCKS5 server error: {}", e);
             }
         });
     }
 
-    // ── Port forwarders ───────────────────────────────────────────────────────
-
     for m in local_tcp_mappings {
-        spawn_local_tcp(netstack.clone(), m);
+        spawn_local_tcp(netstack.clone(), m, stop_tx.clone());
     }
     for m in local_udp_mappings {
-        spawn_local_udp(netstack.clone(), m);
+        spawn_local_udp(netstack.clone(), m, stop_tx.clone());
     }
     for m in remote_tcp_mappings {
-        spawn_remote_tcp(netstack.clone(), m);
+        spawn_remote_tcp(netstack.clone(), m, stop_tx.clone());
     }
     for m in remote_udp_mappings {
-        spawn_remote_udp(netstack.clone(), m);
+        spawn_remote_udp(netstack.clone(), m, stop_tx.clone());
     }
 
     // ── Wait for Ctrl-C ───────────────────────────────────────────────────────
@@ -255,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("yggstack running; press Ctrl-C to exit");
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutting down");
+    let _ = stop_tx.send(());
 
     Ok(())
 }

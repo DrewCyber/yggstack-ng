@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 
 use crate::netstack::YggNetstack;
 use crate::resolver::NameResolver;
@@ -35,26 +36,37 @@ impl Socks5Server {
         Self { netstack, resolver }
     }
 
-    pub async fn serve_tcp(self: Arc<Self>, addr: &str) -> io::Result<()> {
+    pub async fn serve_tcp(self: Arc<Self>, addr: &str, stop_tx: broadcast::Sender<()>) -> io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         tracing::info!("SOCKS5 server listening on {}", addr);
+        let mut stop = stop_tx.subscribe();
         loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    tracing::debug!("SOCKS5 connection from {}", peer);
-                    let srv = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = srv.handle_client(stream).await {
-                            tracing::debug!("SOCKS5 client error: {}", e);
-                        }
-                    });
+            tokio::select! {
+                _ = stop.recv() => {
+                    tracing::info!("SOCKS5: stopped on {}", addr);
+                    break;
                 }
-                Err(e) => tracing::warn!("SOCKS5 accept error: {}", e),
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer)) => {
+                            tracing::debug!("SOCKS5 connection from {}", peer);
+                            let srv = self.clone();
+                            let stop_conn = stop_tx.subscribe();
+                            tokio::spawn(async move {
+                                if let Err(e) = srv.handle_client(stream, stop_conn).await {
+                                    tracing::debug!("SOCKS5 client error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!("SOCKS5 accept error: {}", e),
+                    }
+                }
             }
         }
+        Ok(())
     }
 
-    async fn handle_client(&self, mut client: TcpStream) -> io::Result<()> {
+    async fn handle_client(&self, mut client: TcpStream, mut stop: broadcast::Receiver<()>) -> io::Result<()> {
         // Phase 1: negotiation
         let ver = client.read_u8().await?;
         if ver != SOCKS5_VERSION {
@@ -148,6 +160,9 @@ impl Socks5Server {
         let (mut yr, mut yw) = tokio::io::split(ygg_stream);
 
         tokio::select! {
+            _ = stop.recv() => {
+                tracing::debug!("SOCKS5 relay cancelled for {}", remote_addr);
+            }
             r = tokio::io::copy(&mut cr, &mut yw) => {
                 tracing::debug!("SOCKS5 client→ygg done: {:?}", r);
             }

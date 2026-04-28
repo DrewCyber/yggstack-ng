@@ -233,22 +233,24 @@ impl YggstackMobile {
 
             let resolver = Arc::new(NameResolver::new(netstack.clone(), &nameserver));
 
+            let (stop_tx, _) = tokio::sync::broadcast::channel(1);
+
             if let Some(addr) = socks_addr {
                 let srv = Arc::new(Socks5Server::new(netstack.clone(), resolver.clone()));
                 let a2 = addr.clone();
+                let stop_clone = stop_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = srv.serve_tcp(&a2).await {
+                    if let Err(e) = srv.serve_tcp(&a2, stop_clone).await {
                         tracing::error!("SOCKS5: {}", e);
                     }
                 });
             }
 
-            for m in local_tcp  { spawn_local_tcp(netstack.clone(), m);  }
-            for m in local_udp  { spawn_local_udp(netstack.clone(), m);  }
-            for m in remote_tcp { spawn_remote_tcp(netstack.clone(), m); }
-            for m in remote_udp { spawn_remote_udp(netstack.clone(), m); }
+            for m in local_tcp  { spawn_local_tcp(netstack.clone(), m, stop_tx.clone());  }
+            for m in local_udp  { spawn_local_udp(netstack.clone(), m, stop_tx.clone());  }
+            for m in remote_tcp { spawn_remote_tcp(netstack.clone(), m, stop_tx.clone()); }
+            for m in remote_udp { spawn_remote_udp(netstack.clone(), m, stop_tx.clone()); }
 
-            let (stop_tx, _) = tokio::sync::broadcast::channel(1);
             NodeState {
                 core,
                 _rwc: rwc,
