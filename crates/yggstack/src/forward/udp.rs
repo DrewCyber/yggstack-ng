@@ -112,7 +112,7 @@ pub fn spawn_local_udp(
     mapping: UdpMapping,
     stop_tx: broadcast::Sender<()>,
     stats: Arc<ListenerStatsRegistry>,
-) -> String {
+) -> (String, tokio::task::JoinHandle<()>) {
     let key = local_udp_key(&mapping);
     let entry = stats.entry(
         &key,
@@ -121,7 +121,7 @@ pub fn spawn_local_udp(
         &mapping.target.to_string(),
     );
     let task_key = key.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let local_sock = match OsUdpSocket::bind(mapping.listen).await {
             Ok(s) => {
                 tracing::info!(
@@ -207,7 +207,7 @@ pub fn spawn_local_udp(
         }
         abort_all_sessions(&sessions).await;
     });
-    key
+    (key, handle)
 }
 
 /// Start a remote-udp forwarder.
@@ -217,7 +217,7 @@ pub fn spawn_remote_udp(
     mapping: UdpMapping,
     stop_tx: broadcast::Sender<()>,
     stats: Arc<ListenerStatsRegistry>,
-) -> String {
+) -> (String, tokio::task::JoinHandle<()>) {
     let port = mapping.listen.port();
     let target = mapping.target;
     let key = remote_udp_key(&mapping);
@@ -230,7 +230,7 @@ pub fn spawn_remote_udp(
     let ns = netstack.clone();
 
     let task_key = key.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let ygg_sock = match ns.bind_udp(port) {
             Ok(s) => {
                 tracing::info!("remote-udp: ygg:{} -> {}", port, target);
@@ -316,5 +316,5 @@ pub fn spawn_remote_udp(
         }
         abort_all_sessions(&sessions).await;
     });
-    key
+    (key, handle)
 }

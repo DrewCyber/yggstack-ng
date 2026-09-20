@@ -145,14 +145,28 @@ struct NodeState {
     netstack: Arc<YggNetstack>,
     stop_tx: tokio::sync::broadcast::Sender<()>,
     stats: Arc<ListenerStatsRegistry>,
+    socks_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// A listener started for one mapping; firing `stop_tx` stops it.
+/// A listener started for one mapping; firing `stop_tx` stops it and
+/// `handle` lets stop() join the task so its socket is closed before
+/// returning (Go's Stop() joins every worker the same way).
 struct RunningListener {
     /// Keeps the channel's initial receiver alive so a stop fired before the
     /// task first polls its own subscription is not lost.
     _rx: tokio::sync::broadcast::Receiver<()>,
     stop_tx: tokio::sync::broadcast::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Grace period for a listener task to exit after stop before aborting it.
+const LISTENER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn join_listener(handle: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(LISTENER_STOP_GRACE, &mut *handle).await.is_err() {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 // ── YggstackMobile ────────────────────────────────────────────────────────────
@@ -340,16 +354,17 @@ impl YggstackMobile {
             let stats = ListenerStatsRegistry::new();
             let (stop_tx, _) = tokio::sync::broadcast::channel(1);
 
+            let mut socks_handle = None;
             if let Some(addr) = socks_addr {
                 let srv = Arc::new(Socks5Server::new(netstack.clone(), resolver.clone()));
                 let a2 = addr.clone();
                 let stop_clone = stop_tx.clone();
                 let stats2 = stats.clone();
-                tokio::spawn(async move {
+                socks_handle = Some(tokio::spawn(async move {
                     if let Err(e) = srv.serve_tcp(&a2, stop_clone, stats2).await {
                         tracing::error!("SOCKS5: {}", e);
                     }
-                });
+                }));
             }
 
             let mut listeners = self.listeners.lock().unwrap();
@@ -364,6 +379,7 @@ impl YggstackMobile {
                 netstack,
                 stop_tx,
                 stats,
+                socks_handle,
             }
         });
 
@@ -383,16 +399,29 @@ impl YggstackMobile {
             // of all forwarded connections after a stop/start cycle).
             let _ = self.rt.block_on(node.core.close());
             let _ = node.stop_tx.send(());
+            // Join the SOCKS server so the proxy port is released before
+            // stop() returns (Go joins all workers in Stop()).
+            if let Some(mut socks) = node.socks_handle {
+                self.rt.block_on(join_listener(&mut socks));
+            }
         }
-        // Stop every per-mapping listener as well (they also observe the
-        // node-level stop, this covers late additions), then reset the maps.
+        // Stop and JOIN every per-mapping listener so their listening
+        // sockets are closed before stop() returns — an immediate restart
+        // can then rebind the same ports without racing the old tasks.
         let listeners: Vec<RunningListener> = {
             let mut guard = self.listeners.lock().unwrap();
             guard.drain().map(|(_, v)| v).collect()
         };
-        for l in listeners {
+        let mut handles = Vec::new();
+        for mut l in listeners {
             let _ = l.stop_tx.send(());
+            handles.push(l.handle);
         }
+        self.rt.block_on(async {
+            for h in &mut handles {
+                join_listener(h).await;
+            }
+        });
     }
 
     pub fn set_socks(&self, addr: String) {
@@ -412,13 +441,13 @@ impl YggstackMobile {
         netstack: &Arc<YggNetstack>,
         stats: &Arc<ListenerStatsRegistry>,
         mapping: M,
-        spawn_fn: impl Fn(Arc<YggNetstack>, M, Arc<ListenerStatsRegistry>, tokio::sync::broadcast::Sender<()>) -> String,
+        spawn_fn: impl Fn(Arc<YggNetstack>, M, Arc<ListenerStatsRegistry>, tokio::sync::broadcast::Sender<()>) -> (String, tokio::task::JoinHandle<()>),
     ) {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
-        let key = spawn_fn(netstack.clone(), mapping, stats.clone(), tx.clone());
+        let (key, handle) = spawn_fn(netstack.clone(), mapping, stats.clone(), tx.clone());
         // Keep `rx` alive so a stop fired before the task first polls its own
         // subscription is not lost to a zero-receiver send.
-        listeners.insert(key, RunningListener { _rx: rx, stop_tx: tx });
+        listeners.insert(key, RunningListener { _rx: rx, stop_tx: tx, handle });
     }
 
     pub fn add_local_tcp(&self, spec: String) -> Result<(), YggstackError> {
@@ -508,8 +537,9 @@ impl YggstackMobile {
     }
 
     fn stop_listener(&self, key: &str) {
-        if let Some(l) = self.listeners.lock().unwrap().remove(key) {
+        if let Some(mut l) = self.listeners.lock().unwrap().remove(key) {
             let _ = l.stop_tx.send(());
+            self.rt.block_on(join_listener(&mut l.handle));
         }
     }
 

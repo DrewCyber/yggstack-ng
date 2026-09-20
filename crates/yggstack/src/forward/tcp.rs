@@ -29,13 +29,13 @@ pub fn remote_tcp_key(mapping: &TcpMapping) -> String {
 /// Listens on `mapping.listen` (OS) and forwards each connection to
 /// `mapping.target` (Yggdrasil via netstack).
 /// The task exits cleanly when `stop` receives a value or the sender is dropped.
-/// Returns the listener stats key ("ltcp:<listen>-><target>").
+/// Returns the listener stats key ("ltcp:<listen>-><target>") and the task handle.
 pub fn spawn_local_tcp(
     netstack: Arc<YggNetstack>,
     mapping: TcpMapping,
     stop_tx: broadcast::Sender<()>,
     stats: Arc<ListenerStatsRegistry>,
-) -> String {
+) -> (String, tokio::task::JoinHandle<()>) {
     let key = local_tcp_key(&mapping);
     let entry = stats.entry(
         &key,
@@ -44,7 +44,7 @@ pub fn spawn_local_tcp(
         &mapping.target.to_string(),
     );
     let task_key = key.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let listener = match TcpListener::bind(mapping.listen).await {
             Ok(l) => {
                 tracing::info!(
@@ -87,7 +87,7 @@ pub fn spawn_local_tcp(
             }
         }
     });
-    key
+    (key, handle)
 }
 
 async fn forward_local_tcp(
@@ -116,13 +116,13 @@ async fn forward_local_tcp(
 /// Listens on our Yggdrasil address/port (netstack) and forwards each
 /// incoming connection to `mapping.target` (OS TCP).
 /// The task exits cleanly when `stop` receives a value or the sender is dropped.
-/// Returns the listener stats key ("rtcp:<port>-><target>").
+/// Returns the listener stats key ("rtcp:<port>-><target>") and the task handle.
 pub fn spawn_remote_tcp(
     netstack: Arc<YggNetstack>,
     mapping: TcpMapping,
     stop_tx: broadcast::Sender<()>,
     stats: Arc<ListenerStatsRegistry>,
-) -> String {
+) -> (String, tokio::task::JoinHandle<()>) {
     let port = mapping.listen.port();
     let target = mapping.target;
     let key = remote_tcp_key(&mapping);
@@ -134,7 +134,7 @@ pub fn spawn_remote_tcp(
     );
     let ns = netstack.clone();
     let task_key = key.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let listener = match ns.listen_tcp(port) {
             Ok(l) => {
                 tracing::info!("remote-tcp: ygg:{} → {}", port, target);
@@ -171,7 +171,7 @@ pub fn spawn_remote_tcp(
             }
         }
     });
-    key
+    (key, handle)
 }
 
 async fn forward_remote_tcp(
