@@ -7,6 +7,7 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::task::{Context as TaskContext, Poll, Waker};
 
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
@@ -184,6 +185,9 @@ impl NetstackState {
 }
 
 // ── YggNetstack ───────────────────────────────────────────────────────────────
+
+/// Maximum time to wait for a dialed TCP connection to become ESTABLISHED.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct YggNetstack {
     state: Arc<Mutex<NetstackState>>,
@@ -404,8 +408,18 @@ impl YggNetstack {
             poll_wakeup: self.poll_wakeup.clone(),
         };
 
-        stream.wait_connected().await?;
-        Ok(stream)
+        // Bound the handshake wait: with no working overlay route (e.g.
+        // right after a node restart, before the first peer link is up) the
+        // SYN would be retransmitted forever and callers would pile up
+        // instead of failing fast and retrying once links are healthy.
+        // Dropping the stream on timeout aborts and removes the socket.
+        match tokio::time::timeout(CONNECT_TIMEOUT, stream.wait_connected()).await {
+            Ok(result) => result.map(|_| stream),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "netstack connect timed out",
+            )),
+        }
     }
 
     /// Dial a generic connection (network can be "tcp", "tcp6").

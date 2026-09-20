@@ -313,6 +313,13 @@ impl YggstackMobile {
         let node = { self.state.lock().unwrap().take() };
         if let Some(node) = node {
             self.rt.block_on(node.core.close_multicast());
+            // Close links + the ironwood core as well. Without this the old
+            // instance keeps its peer connections alive under the same node
+            // identity; after a restart, remote peers may keep routing
+            // inbound traffic over the dead instance's links until they hit
+            // their idle/keepalive timeout (observed as a 1-2 minute stall
+            // of all forwarded connections after a stop/start cycle).
+            let _ = self.rt.block_on(node.core.close());
             let _ = node.stop_tx.send(());
         }
         // Stop every per-mapping listener as well (they also observe the
