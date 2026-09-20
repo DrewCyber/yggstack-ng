@@ -4,8 +4,13 @@ use std::sync::Arc;
 use getopts::Options;
 use tracing_subscriber::EnvFilter;
 
+use yggdrasil::admin::AdminSocket;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
+
+#[cfg(feature = "dhat-profiling")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use yggstack::config;
 use yggstack::forward::tcp::{spawn_local_tcp, spawn_remote_tcp};
@@ -15,8 +20,13 @@ use yggstack::netstack::YggNetstack;
 use yggstack::resolver::NameResolver;
 use yggstack::socks::Socks5Server;
 
+use yggstack::BUILD_NUM;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "dhat-profiling")]
+    let _profiler = dhat::Profiler::builder().file_name("/data/data/com.termux/files/home/dhat-heap.json").build();
+
     let args: Vec<String> = std::env::args().collect();
 
     let mut opts = Options::new();
@@ -196,8 +206,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     core.init_links().await;
     core.start().await;
 
+    // Start admin socket (if configured in config, e.g. "tcp://127.0.0.1:9001")
+    let _admin = match AdminSocket::new(&cfg.admin_listen, core.clone()).await {
+        Ok(admin) => Some(admin),
+        Err(e) => {
+            tracing::warn!("Failed to start admin socket: {}", e);
+            None
+        }
+    };
+
     let mtu = core.mtu();
-    let rwc = ReadWriteCloser::new(core.clone(), mtu);
+    let rwc = ReadWriteCloser::new(
+        core.clone(),
+        mtu,
+        #[cfg(feature = "ckr")]
+        Some(&cfg.tunnel_routing),
+        // Upstream's stateful firewall: yggstack does not expose it, so stay
+        // disabled and keep the previous packet-filtering behaviour.
+        None,
+    );
     core.set_path_notify(rwc.clone());
 
     let our_addr = config::addr_for_key(&public_key);
@@ -208,7 +235,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Create netstack ───────────────────────────────────────────────────────
 
-    let netstack = YggNetstack::new(rwc.clone(), our_addr, mtu);
+    let netstack = YggNetstack::new(
+        rwc.clone(),
+        our_addr,
+        mtu,
+        #[cfg(feature = "ckr")]
+        Some(&cfg.tunnel_routing),
+    );
 
     // ── Resolver ──────────────────────────────────────────────────────────────
 
@@ -255,11 +288,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Wait for Ctrl-C ───────────────────────────────────────────────────────
 
-    tracing::info!("yggstack running; press Ctrl-C to exit");
-    tokio::signal::ctrl_c().await?;
+    tracing::info!("yggstack running (build #{}); press Ctrl-C or send SIGTERM to exit", BUILD_NUM);
+
+    // Wait for either SIGINT (Ctrl-C) or SIGTERM (sv stop / kill)
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
     tracing::info!("Shutting down");
     let _ = stop_tx.send(());
 
+    // DHAT profiler (if enabled) will write dhat-heap.json on drop here
     Ok(())
 }
 

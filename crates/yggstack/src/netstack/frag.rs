@@ -42,6 +42,10 @@ impl FragReassembler {
         Self { slots: HashMap::new() }
     }
 
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Feed an incoming IPv6 packet.  Returns:
     /// - `None`  — packet is a fragment, not yet complete (or malformed)
     /// - `Some(pkt)` — reassembled packet ready to deliver (or non-fragment pass-through)
