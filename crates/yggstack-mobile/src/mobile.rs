@@ -74,9 +74,10 @@ pub fn get_version() -> String {
 }
 
 /// Measure RTT to a QUIC peer.
-/// The Rust yggdrasil-ng core does not support QUIC connections, so this
-/// always returns -1 (unknown/unsupported). It exists for API compatibility
-/// with the Android app's public peer browser.
+/// The QUIC transport is compiled in (yggdrasil "quic" feature), but no
+/// standalone handshake helper is exposed yet, so this still returns -1
+/// (unknown). It exists for API compatibility with the Android app's
+/// public peer browser.
 pub fn check_quic_peer(_uri: String) -> i64 {
     -1
 }
