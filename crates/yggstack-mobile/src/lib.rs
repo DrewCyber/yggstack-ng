@@ -1,6 +1,7 @@
 uniffi::include_scaffolding!("yggstack_mobile");
 
 mod mobile;
+mod quic_check;
 
 pub use mobile::{
     YggstackError,

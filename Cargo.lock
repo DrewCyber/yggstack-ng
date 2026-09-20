@@ -3147,6 +3147,8 @@ name = "yggstack-mobile"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "quinn",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

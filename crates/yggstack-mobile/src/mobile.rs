@@ -73,13 +73,11 @@ pub fn get_version() -> String {
     format!("yggstack {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Measure RTT to a QUIC peer.
-/// The QUIC transport is compiled in (yggdrasil "quic" feature), but no
-/// standalone handshake helper is exposed yet, so this still returns -1
-/// (unknown). It exists for API compatibility with the Android app's
-/// public peer browser.
-pub fn check_quic_peer(_uri: String) -> i64 {
-    -1
+/// Measure RTT to a QUIC peer by completing the QUIC/TLS handshake
+/// (TLS 1.3, no ALPN, certificates accepted as-is). Returns RTT in
+/// milliseconds, or -1 on failure/timeout (5s budget incl. DNS).
+pub fn check_quic_peer(uri: String) -> i64 {
+    crate::quic_check::check_quic_rtt(&uri)
 }
 
 // ── Running node state ────────────────────────────────────────────────────────
@@ -239,6 +237,7 @@ impl YggstackMobile {
         let remote_tcp = self.remote_tcp.lock().unwrap().clone();
         let remote_udp = self.remote_udp.lock().unwrap().clone();
 
+        let want_multicast = !cfg.multicast_interfaces.is_empty();
         let node = self.rt.block_on(async {
             let pk = signing_key.verifying_key().to_bytes();
             let our_addr = config::addr_for_key(&pk);
@@ -247,6 +246,14 @@ impl YggstackMobile {
             let core = Core::new(signing_key, cfg);
             core.init_links().await;
             core.start().await;
+            if want_multicast {
+                // Beacon/listen per multicast_interfaces; the core handles
+                // interface discovery (Android can override via
+                // update_network_interfaces, exposed later if needed).
+                if let Err(e) = core.start_multicast().await {
+                    tracing::warn!("multicast discovery: {}", e);
+                }
+            }
             let mtu = core.mtu();
             let rwc = ReadWriteCloser::new(
                 core.clone(),
@@ -305,6 +312,7 @@ impl YggstackMobile {
     pub fn stop(&self) {
         let node = { self.state.lock().unwrap().take() };
         if let Some(node) = node {
+            self.rt.block_on(node.core.close_multicast());
             let _ = node.stop_tx.send(());
         }
         // Stop every per-mapping listener as well (they also observe the

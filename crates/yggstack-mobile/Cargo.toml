@@ -23,6 +23,10 @@ ckr = []
 yggstack   = { path = "../yggstack", features = ["ckr"] }
 yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "85f71fe", default-features = false, features = ["ckr", "ws", "quic"] }
 
+# QUIC RTT probe (check_quic_peer) — versions/features mirror the yggdrasil pins
+quinn  = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+
 tokio      = { version = "1", features = ["full"] }
 uniffi     = { version = "0.29", features = ["build", "cli"] }
 hex        = "0.4"
