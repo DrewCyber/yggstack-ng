@@ -187,7 +187,9 @@ impl NetstackState {
 // ── YggNetstack ───────────────────────────────────────────────────────────────
 
 /// Maximum time to wait for a dialed TCP connection to become ESTABLISHED.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Matches the Go yggstack, which bounds every dial (forwards and SOCKS)
+/// with a 10-second timeout.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct YggNetstack {
     state: Arc<Mutex<NetstackState>>,

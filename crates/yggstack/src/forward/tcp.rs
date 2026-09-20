@@ -181,7 +181,14 @@ async fn forward_remote_tcp(
     entry: Arc<ListenerStats>,
 ) -> std::io::Result<()> {
     let _guard = ConnGuard::new(entry.clone());
-    let local = TcpStream::connect(target).await?;
+    let local = tokio::time::timeout(
+        crate::netstack::CONNECT_TIMEOUT,
+        TcpStream::connect(target),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "local connect timed out")
+    })??;
     let (lr, mut lw) = local.into_split();
     let (mut yr, mut yw) = tokio::io::split(ygg_stream);
     tokio::select! {
