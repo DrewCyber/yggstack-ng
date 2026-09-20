@@ -67,7 +67,7 @@ impl Socks5Server {
         Ok(())
     }
 
-    async fn handle_client(&self, mut client: TcpStream, mut stop: broadcast::Receiver<()>) -> io::Result<()> {
+    async fn handle_client(&self, mut client: TcpStream, stop: broadcast::Receiver<()>) -> io::Result<()> {
         // Phase 1: negotiation
         let ver = client.read_u8().await?;
         if ver != SOCKS5_VERSION {
@@ -108,7 +108,7 @@ impl Socks5Server {
         let dest_port = client.read_u16().await?;
 
         match cmd {
-            CMD_CONNECT => self.handle_connect(client, dest_addr, dest_port).await,
+            CMD_CONNECT => self.handle_connect(client, dest_addr, dest_port, stop).await,
             CMD_UDP_ASSOCIATE => self.handle_udp_associate(client).await,
             _ => {
                 send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
@@ -125,6 +125,7 @@ impl Socks5Server {
         mut client: TcpStream,
         dest_addr: Destination,
         dest_port: u16,
+        mut stop: broadcast::Receiver<()>,
     ) -> io::Result<()> {
         // Resolve hostname to an IPv6 address.
         let remote_addr: SocketAddr = match dest_addr {

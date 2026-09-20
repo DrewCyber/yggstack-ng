@@ -274,8 +274,8 @@ impl YggNetstack {
                 let mut buf = vec![0u8; 65536];
                 loop {
                     match rwc2.read(&mut buf).await {
-                        Ok(n) if n > 0
-                            && pkt_tx.send(buf[..n].to_vec()).await.is_err() =>
+                        Ok(data) if !data.is_empty()
+                            && pkt_tx.send(data.to_vec()).await.is_err() =>
                         {
                             break;
                         }

@@ -1016,7 +1016,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironwood"
 version = "0.2.0"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=3ac41c1#3ac41c1977d6b309a3901aaf2e5db8fe22f27475"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=85f71fe#85f71fe42e4c201aa27fd74fb34d02657330f991"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2863,7 +2863,7 @@ dependencies = [
 [[package]]
 name = "yggdrasil"
 version = "0.3.0"
-source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=3ac41c1#3ac41c1977d6b309a3901aaf2e5db8fe22f27475"
+source = "git+https://github.com/Revertron/Yggdrasil-ng?rev=85f71fe#85f71fe42e4c201aa27fd74fb34d02657330f991"
 dependencies = [
  "arc-swap",
  "blake2",
@@ -2874,6 +2874,7 @@ dependencies = [
  "hex",
  "ipnet",
  "ironwood",
+ "libc",
  "rand",
  "rcgen",
  "route_manager",
