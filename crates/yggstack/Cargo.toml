@@ -22,7 +22,7 @@ dhat-profiling = ["dep:dhat"]
 
 [dependencies]
 # Yggdrasil-ng core (no TUN, with CKR)
-yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false, features = ["ckr"] }
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "3ac41c1", default-features = false, features = ["ckr"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -233,6 +233,8 @@ impl YggstackMobile {
                 mtu,
                 #[cfg(feature = "ckr")]
                 Some(&tunnel_routing),
+                // Firewall stays disabled here too — see yggstack/src/main.rs.
+                None,
             );
             core.set_path_notify(rwc.clone());
 

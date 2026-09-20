@@ -221,6 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mtu,
         #[cfg(feature = "ckr")]
         Some(&cfg.tunnel_routing),
+        // Upstream's stateful firewall: yggstack does not expose it, so stay
+        // disabled and keep the previous packet-filtering behaviour.
+        None,
     );
     core.set_path_notify(rwc.clone());
 

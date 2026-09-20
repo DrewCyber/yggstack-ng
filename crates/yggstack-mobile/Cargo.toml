@@ -21,7 +21,7 @@ ckr = []
 
 [dependencies]
 yggstack   = { path = "../yggstack", features = ["ckr"] }
-yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", default-features = false, features = ["ckr"] }
+yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "3ac41c1", default-features = false, features = ["ckr"] }
 
 tokio      = { version = "1", features = ["full"] }
 uniffi     = { version = "0.29", features = ["build", "cli"] }
