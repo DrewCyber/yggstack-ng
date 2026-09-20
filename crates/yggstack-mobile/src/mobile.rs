@@ -15,6 +15,60 @@ use yggstack::stats::ListenerStatsRegistry;
 
 // ── Tracing init ──────────────────────────────────────────────────────────────
 
+/// App-side log sink (set from set_log_callback; absent = nobody listening).
+static LOG_SINK: Mutex<Option<Box<dyn LogCallback>>> = Mutex::new(None);
+
+/// Verbosity for the app callback layer: 0=error 1=warn 2=info 3=debug 4=trace.
+static LOG_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Filter that gates events for the app callback by the global LOG_LEVEL.
+#[derive(Clone, Copy)]
+struct CallbackFilter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S> for CallbackFilter {
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        _: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let lvl = match *meta.level() {
+            tracing::Level::ERROR => 0u8,
+            tracing::Level::WARN => 1,
+            tracing::Level::INFO => 2,
+            tracing::Level::DEBUG => 3,
+            tracing::Level::TRACE => 4,
+        };
+        lvl <= LOG_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Write target that forwards formatted events into the app's LogCallback.
+struct CallbackWriter;
+
+impl std::io::Write for CallbackWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let line = String::from_utf8_lossy(buf);
+        if let Some(cb) = LOG_SINK.lock().unwrap().as_ref() {
+            cb.on_log(line.trim_end().to_string());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct MakeCallbackWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeCallbackWriter {
+    type Writer = CallbackWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        CallbackWriter
+    }
+}
+
 fn init_tracing() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -22,22 +76,25 @@ fn init_tracing() {
         use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::EnvFilter;
 
-        let filter = EnvFilter::new("yggstack=info,yggdrasil=info,ironwood=warn");
+        use tracing_subscriber::Layer as _;
+
+        let logcat_filter = EnvFilter::new("yggstack=info,yggdrasil=info,ironwood=warn");
+
+        // App callback layer: level adjustable at runtime via set_log_level.
+        let callback_layer = tracing_subscriber::fmt::layer()
+            .with_writer(MakeCallbackWriter)
+            .with_ansi(false)
+            .without_time();
 
         #[cfg(target_os = "android")]
-        {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(tracing_android::layer("yggstack").unwrap())
-                .init();
-        }
+        let logcat_layer = tracing_android::layer("yggstack").unwrap();
         #[cfg(not(target_os = "android"))]
-        {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(tracing_subscriber::fmt::layer())
-                .init();
-        }
+        let logcat_layer = tracing_subscriber::fmt::layer();
+
+        tracing_subscriber::registry()
+            .with(logcat_layer.with_filter(logcat_filter))
+            .with(callback_layer.with_filter(CallbackFilter))
+            .init();
     });
 }
 
@@ -104,8 +161,6 @@ pub struct YggstackMobile {
     rt: Arc<tokio::runtime::Runtime>,
     state: Mutex<Option<NodeState>>,
     cfg: Mutex<Option<yggdrasil::config::Config>>,
-    log_callback: Mutex<Option<Box<dyn LogCallback>>>,
-    log_level: Mutex<String>,
     socks_addr: Mutex<Option<String>>,
     nameserver: Mutex<String>,
     local_tcp: Mutex<Vec<TcpMapping>>,
@@ -134,8 +189,6 @@ impl YggstackMobile {
             rt: Arc::new(rt),
             state: Mutex::new(None),
             cfg: Mutex::new(None),
-            log_callback: Mutex::new(None),
-            log_level: Mutex::new("info".to_string()),
             socks_addr: Mutex::new(None),
             nameserver: Mutex::new(String::new()),
             local_tcp: Mutex::new(Vec::new()),
@@ -147,11 +200,20 @@ impl YggstackMobile {
     }
 
     pub fn set_log_callback(&self, callback: Box<dyn LogCallback>) {
-        *self.log_callback.lock().unwrap() = Some(callback);
+        *LOG_SINK.lock().unwrap() = Some(callback);
     }
 
+    /// Set the app-facing log verbosity ("error".."trace"). Controls which
+    /// events reach the LogCallback; the logcat output keeps its own filter.
     pub fn set_log_level(&self, level: String) {
-        *self.log_level.lock().unwrap() = level;
+        let lvl = match level.to_ascii_lowercase().as_str() {
+            "error" => 0u8,
+            "warn" => 1,
+            "trace" => 4,
+            "debug" => 3,
+            _ => 2,
+        };
+        LOG_LEVEL.store(lvl, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn load_config(&self, toml_config: String) -> Result<(), YggstackError> {
