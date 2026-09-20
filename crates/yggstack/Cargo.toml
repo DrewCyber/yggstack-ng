@@ -47,6 +47,7 @@ hex = "0.4"
 # Config / CLI
 getopts = "0.2"
 toml  = "1"
+serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 
 # Logging

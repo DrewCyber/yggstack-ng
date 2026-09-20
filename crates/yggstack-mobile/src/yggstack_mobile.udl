@@ -89,6 +89,7 @@ interface YggstackMobile {
     void set_nameserver(string addr);
 
     /// Add a local-tcp forwarding spec, e.g. "8080:[addr]:80".
+    /// While the node is running the listener starts immediately.
     [Throws=YggstackError]
     void add_local_tcp(string spec);
 
@@ -104,10 +105,32 @@ interface YggstackMobile {
     [Throws=YggstackError]
     void add_remote_udp(string spec);
 
+    /// Remove a single local-tcp mapping (stops its listener while running).
+    [Throws=YggstackError]
+    void remove_local_tcp(string spec);
+
+    /// Remove a single local-udp mapping.
+    [Throws=YggstackError]
+    void remove_local_udp(string spec);
+
+    /// Remove a single remote-tcp mapping.
+    [Throws=YggstackError]
+    void remove_remote_tcp(string spec);
+
+    /// Remove a single remote-udp mapping.
+    [Throws=YggstackError]
+    void remove_remote_udp(string spec);
+
     /// Remove all configured mappings.
     void clear_mappings();
 
     /// Return JSON array of connected peer stats, compatible with the
     /// Android peer details panel. Returns "[]" when not running.
     string get_peers_json();
+
+    /// Return JSON array of per-listener connection/traffic stats, the same
+    /// shape as the Go yggstack GetListenersJSON: [{"Key","Kind","Listen",
+    /// "Target","ActiveConns","TotalConns","RXBytes","TXBytes"}].
+    /// Returns "[]" when not running.
+    string get_listeners_json();
 };

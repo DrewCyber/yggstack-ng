@@ -10,3 +10,6 @@ tmp/
 
 # Development context (local copies of upstream sources)
 context/
+
+# Prebuilt Android native libs – build from source with cargo-ndk
+android-build/jni/

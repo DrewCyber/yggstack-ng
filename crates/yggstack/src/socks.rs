@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 
 use crate::netstack::YggNetstack;
 use crate::resolver::NameResolver;
+use crate::stats::{counting_copy, ConnGuard, Dir, ListenerStats, ListenerStatsRegistry, SOCKS_STATS_KEY};
 
 // SOCKS5 constants
 const SOCKS5_VERSION: u8 = 5;
@@ -37,14 +38,21 @@ impl Socks5Server {
         Self { netstack, resolver }
     }
 
-    pub async fn serve_tcp(self: Arc<Self>, addr: &str, stop_tx: broadcast::Sender<()>) -> io::Result<()> {
+    pub async fn serve_tcp(
+        self: Arc<Self>,
+        addr: &str,
+        stop_tx: broadcast::Sender<()>,
+        stats: Arc<ListenerStatsRegistry>,
+    ) -> io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
+        let entry = stats.entry(SOCKS_STATS_KEY, "socks", &listener.local_addr()?.to_string(), "");
         tracing::info!("SOCKS5 server listening on {}", addr);
         let mut stop = stop_tx.subscribe();
         loop {
             tokio::select! {
                 _ = stop.recv() => {
                     tracing::info!("SOCKS5: stopped on {}", addr);
+                    stats.remove(SOCKS_STATS_KEY);
                     break;
                 }
                 result = listener.accept() => {
@@ -53,8 +61,9 @@ impl Socks5Server {
                             tracing::debug!("SOCKS5 connection from {}", peer);
                             let srv = self.clone();
                             let stop_conn = stop_tx.subscribe();
+                            let entry = entry.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = srv.handle_client(stream, stop_conn).await {
+                                if let Err(e) = srv.handle_client(stream, stop_conn, entry).await {
                                     tracing::debug!("SOCKS5 client error: {}", e);
                                 }
                             });
@@ -67,7 +76,12 @@ impl Socks5Server {
         Ok(())
     }
 
-    async fn handle_client(&self, mut client: TcpStream, stop: broadcast::Receiver<()>) -> io::Result<()> {
+    async fn handle_client(
+        &self,
+        mut client: TcpStream,
+        stop: broadcast::Receiver<()>,
+        entry: Arc<ListenerStats>,
+    ) -> io::Result<()> {
         // Phase 1: negotiation
         let ver = client.read_u8().await?;
         if ver != SOCKS5_VERSION {
@@ -108,8 +122,8 @@ impl Socks5Server {
         let dest_port = client.read_u16().await?;
 
         match cmd {
-            CMD_CONNECT => self.handle_connect(client, dest_addr, dest_port, stop).await,
-            CMD_UDP_ASSOCIATE => self.handle_udp_associate(client).await,
+            CMD_CONNECT => self.handle_connect(client, dest_addr, dest_port, stop, entry).await,
+            CMD_UDP_ASSOCIATE => self.handle_udp_associate(client, entry).await,
             _ => {
                 send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
                 Err(io::Error::new(
@@ -126,6 +140,7 @@ impl Socks5Server {
         dest_addr: Destination,
         dest_port: u16,
         mut stop: broadcast::Receiver<()>,
+        entry: Arc<ListenerStats>,
     ) -> io::Result<()> {
         // Resolve hostname to an IPv6 address.
         let remote_addr: SocketAddr = match dest_addr {
@@ -168,17 +183,18 @@ impl Socks5Server {
         tracing::debug!("SOCKS5 relaying data for {}", remote_addr);
 
         // Relay data bidirectionally.
-        let (mut cr, mut cw) = client.into_split();
+        let _guard = ConnGuard::new(entry.clone());
+        let (cr, mut cw) = client.into_split();
         let (mut yr, mut yw) = tokio::io::split(ygg_stream);
 
         tokio::select! {
             _ = stop.recv() => {
                 tracing::debug!("SOCKS5 relay cancelled for {}", remote_addr);
             }
-            r = tokio::io::copy(&mut cr, &mut yw) => {
+            r = counting_copy(cr, &mut yw, entry.clone(), Dir::Tx) => {
                 tracing::debug!("SOCKS5 client→ygg done: {:?}", r);
             }
-            r = tokio::io::copy(&mut yr, &mut cw) => {
+            r = counting_copy(&mut yr, &mut cw, entry, Dir::Rx) => {
                 tracing::debug!("SOCKS5 ygg→client done: {:?}", r);
             }
         }
@@ -186,7 +202,7 @@ impl Socks5Server {
         Ok(())
     }
 
-    async fn handle_udp_associate(&self, mut client: TcpStream) -> io::Result<()> {
+    async fn handle_udp_associate(&self, mut client: TcpStream, entry: Arc<ListenerStats>) -> io::Result<()> {
         // Bind an OS UDP socket for the relay. Use the same IP as the TCP
         // connection so the client can reach it.
         let local_tcp_addr = client.local_addr()?;
@@ -201,8 +217,11 @@ impl Socks5Server {
         let netstack = self.netstack.clone();
 
         // Spawn the UDP relay loop. It runs until the TCP control channel closes.
+        // Counted as one session in the socks listener gauges.
         let relay_clone = relay.clone();
+        let entry = entry.clone();
         let relay_task = tokio::spawn(async move {
+            let _guard = ConnGuard::new(entry.clone());
             let mut buf = [0u8; 4096];
             loop {
                 let (n, client_addr) = match relay_clone.recv_from(&mut buf).await {
@@ -239,6 +258,7 @@ impl Socks5Server {
                     tracing::debug!("UDP ASSOCIATE send_to {} failed: {}", dest, e);
                     continue;
                 }
+                entry.tx_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
                 // Receive response with timeout
                 let mut resp_buf = [0u8; 4096];
@@ -250,6 +270,7 @@ impl Socks5Server {
 
                 match recv_result {
                     Ok(Ok((resp_n, resp_addr))) => {
+                        entry.rx_bytes.fetch_add(resp_n as u64, std::sync::atomic::Ordering::Relaxed);
                         // Build SOCKS5 UDP response header + payload
                         let resp_packet = build_udp_header(resp_addr, &resp_buf[..resp_n]);
                         let _ = relay_clone.send_to(&resp_packet, client_addr).await;

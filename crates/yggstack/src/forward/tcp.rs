@@ -12,13 +12,38 @@ use tokio::sync::broadcast;
 
 use crate::mapping::TcpMapping;
 use crate::netstack::YggNetstack;
+use crate::stats::{counting_copy, ConnGuard, Dir, ListenerStats, ListenerStatsRegistry};
+
+/// Stats/registry key for a local-tcp mapping ("ltcp:<listen>-><target>").
+pub fn local_tcp_key(mapping: &TcpMapping) -> String {
+    format!("ltcp:{}->{}", mapping.listen, mapping.target)
+}
+
+/// Stats/registry key for a remote-tcp mapping ("rtcp:<port>-><target>").
+pub fn remote_tcp_key(mapping: &TcpMapping) -> String {
+    format!("rtcp:{}->{}", mapping.listen.port(), mapping.target)
+}
 
 /// Start a local-tcp forwarder.
 ///
 /// Listens on `mapping.listen` (OS) and forwards each connection to
 /// `mapping.target` (Yggdrasil via netstack).
 /// The task exits cleanly when `stop` receives a value or the sender is dropped.
-pub fn spawn_local_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx: broadcast::Sender<()>) {
+/// Returns the listener stats key ("ltcp:<listen>-><target>").
+pub fn spawn_local_tcp(
+    netstack: Arc<YggNetstack>,
+    mapping: TcpMapping,
+    stop_tx: broadcast::Sender<()>,
+    stats: Arc<ListenerStatsRegistry>,
+) -> String {
+    let key = local_tcp_key(&mapping);
+    let entry = stats.entry(
+        &key,
+        "local-tcp",
+        &mapping.listen.to_string(),
+        &mapping.target.to_string(),
+    );
+    let task_key = key.clone();
     tokio::spawn(async move {
         let listener = match TcpListener::bind(mapping.listen).await {
             Ok(l) => {
@@ -31,6 +56,7 @@ pub fn spawn_local_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx:
             }
             Err(e) => {
                 tracing::error!("local-tcp bind {}: {}", mapping.listen, e);
+                stats.remove(&task_key);
                 return;
             }
         };
@@ -39,6 +65,7 @@ pub fn spawn_local_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx:
             tokio::select! {
                 _ = stop.recv() => {
                     tracing::info!("local-tcp: stopped {} → {}", mapping.listen, mapping.target);
+                    stats.remove(&task_key);
                     break;
                 }
                 result = listener.accept() => {
@@ -47,8 +74,9 @@ pub fn spawn_local_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx:
                             let ns = netstack.clone();
                             let target = mapping.target;
                             let stop_conn = stop_tx.subscribe();
+                            let entry = entry.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = forward_local_tcp(client, ns, target, stop_conn).await {
+                                if let Err(e) = forward_local_tcp(client, ns, target, stop_conn, entry).await {
                                     tracing::debug!("local-tcp fwd: {}", e);
                                 }
                             });
@@ -59,6 +87,7 @@ pub fn spawn_local_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx:
             }
         }
     });
+    key
 }
 
 async fn forward_local_tcp(
@@ -66,14 +95,18 @@ async fn forward_local_tcp(
     netstack: Arc<YggNetstack>,
     target: SocketAddr,
     mut stop: broadcast::Receiver<()>,
+    entry: Arc<ListenerStats>,
 ) -> std::io::Result<()> {
+    let _guard = ConnGuard::new(entry.clone());
     let ygg = netstack.dial_tcp(target).await?;
-    let (mut cr, mut cw) = client.into_split();
+    let (cr, mut cw) = client.into_split();
     let (mut yr, mut yw) = tokio::io::split(ygg);
     tokio::select! {
         _ = stop.recv() => {}
-        _ = tokio::io::copy(&mut cr, &mut yw) => {}
-        _ = tokio::io::copy(&mut yr, &mut cw) => {}
+        // client → ygg: written to the Yggdrasil leg, counts as TX
+        _ = counting_copy(cr, &mut yw, entry.clone(), Dir::Tx) => {}
+        // ygg → client: read from the Yggdrasil leg, counts as RX
+        _ = counting_copy(&mut yr, &mut cw, entry, Dir::Rx) => {}
     }
     Ok(())
 }
@@ -83,10 +116,24 @@ async fn forward_local_tcp(
 /// Listens on our Yggdrasil address/port (netstack) and forwards each
 /// incoming connection to `mapping.target` (OS TCP).
 /// The task exits cleanly when `stop` receives a value or the sender is dropped.
-pub fn spawn_remote_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx: broadcast::Sender<()>) {
+/// Returns the listener stats key ("rtcp:<port>-><target>").
+pub fn spawn_remote_tcp(
+    netstack: Arc<YggNetstack>,
+    mapping: TcpMapping,
+    stop_tx: broadcast::Sender<()>,
+    stats: Arc<ListenerStatsRegistry>,
+) -> String {
     let port = mapping.listen.port();
     let target = mapping.target;
+    let key = remote_tcp_key(&mapping);
+    let entry = stats.entry(
+        &key,
+        "remote-tcp",
+        &format!("ygg:{}", port),
+        &target.to_string(),
+    );
     let ns = netstack.clone();
+    let task_key = key.clone();
     tokio::spawn(async move {
         let listener = match ns.listen_tcp(port) {
             Ok(l) => {
@@ -95,6 +142,7 @@ pub fn spawn_remote_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx
             }
             Err(e) => {
                 tracing::error!("remote-tcp listen ygg:{}: {}", port, e);
+                stats.remove(&task_key);
                 return;
             }
         };
@@ -103,14 +151,16 @@ pub fn spawn_remote_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx
             tokio::select! {
                 _ = stop.recv() => {
                     tracing::info!("remote-tcp: stopped ygg:{} → {}", port, target);
+                    stats.remove(&task_key);
                     break;
                 }
                 result = listener.accept() => {
                     match result {
                         Ok(ygg_stream) => {
                             let stop_conn = stop_tx.subscribe();
+                            let entry = entry.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = forward_remote_tcp(ygg_stream, target, stop_conn).await {
+                                if let Err(e) = forward_remote_tcp(ygg_stream, target, stop_conn, entry).await {
                                     tracing::debug!("remote-tcp fwd: {}", e);
                                 }
                             });
@@ -121,20 +171,25 @@ pub fn spawn_remote_tcp(netstack: Arc<YggNetstack>, mapping: TcpMapping, stop_tx
             }
         }
     });
+    key
 }
 
 async fn forward_remote_tcp(
     ygg_stream: crate::netstack::TcpStream,
     target: SocketAddr,
     mut stop: broadcast::Receiver<()>,
+    entry: Arc<ListenerStats>,
 ) -> std::io::Result<()> {
+    let _guard = ConnGuard::new(entry.clone());
     let local = TcpStream::connect(target).await?;
-    let (mut lr, mut lw) = local.into_split();
+    let (lr, mut lw) = local.into_split();
     let (mut yr, mut yw) = tokio::io::split(ygg_stream);
     tokio::select! {
         _ = stop.recv() => {}
-        _ = tokio::io::copy(&mut yr, &mut lw) => {}
-        _ = tokio::io::copy(&mut lr, &mut yw) => {}
+        // ygg → local: read from the Yggdrasil leg, counts as RX
+        _ = counting_copy(&mut yr, &mut lw, entry.clone(), Dir::Rx) => {}
+        // local → ygg: written to the Yggdrasil leg, counts as TX
+        _ = counting_copy(lr, &mut yw, entry, Dir::Tx) => {}
     }
     Ok(())
 }

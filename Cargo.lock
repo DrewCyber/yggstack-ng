@@ -2909,6 +2909,7 @@ dependencies = [
  "hex",
  "rand",
  "serde",
+ "serde_json",
  "smoltcp",
  "thiserror",
  "tokio",
