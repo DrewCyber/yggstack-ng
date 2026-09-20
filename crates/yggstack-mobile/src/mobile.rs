@@ -413,7 +413,7 @@ impl YggstackMobile {
             guard.drain().map(|(_, v)| v).collect()
         };
         let mut handles = Vec::new();
-        for mut l in listeners {
+        for l in listeners {
             let _ = l.stop_tx.send(());
             handles.push(l.handle);
         }
