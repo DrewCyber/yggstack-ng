@@ -47,22 +47,41 @@ for entry in "${ABIS[@]}"; do
     -- build --release -p yggstack-mobile --manifest-path "$MOBILE_CRATE/Cargo.toml"
 done
 
-# Generate Kotlin bindings
+# Generate Kotlin bindings.
+# uniffi-bindgen --library mode loads the library at runtime to extract the
+# interface metadata, so it needs a library the HOST can load: the Android
+# .so artifacts (ELF, foreign arch/bionic) cannot be dlopened on macOS or
+# Linux. Build the cdylib for the host and generate from it — the Kotlin
+# output is target-independent.
 echo "=== Generating Kotlin bindings ==="
+
+cargo build --release -p yggstack-mobile
+
 BINDGEN="$WORKSPACE_ROOT/target/release/uniffi-bindgen"
-
-cargo build --release -p yggstack-mobile --bin uniffi-bindgen 2>/dev/null || true
-
-if [[ -f "$BINDGEN" ]]; then
-  LIB_PATH="$(ls "$OUT_DIR/jni/arm64-v8a/libyggstack_mobile.so" 2>/dev/null | head -1)"
-  if [[ -n "$LIB_PATH" ]]; then
-    "$BINDGEN" generate \
-      --library "$LIB_PATH" \
-      --language kotlin \
-      --out-dir "$OUT_DIR/kotlin"
-    echo "Kotlin bindings written to $OUT_DIR/kotlin"
+HOST_LIB=""
+for cand in "$WORKSPACE_ROOT"/target/release/libyggstack_mobile.dylib "$WORKSPACE_ROOT"/target/release/libyggstack_mobile.so; do
+  if [[ -f "$cand" ]]; then
+    HOST_LIB="$cand"
+    break
   fi
+done
+
+if [[ -z "$HOST_LIB" ]]; then
+  echo "ERROR: host build of libyggstack_mobile not found under target/release; cannot generate bindings."
+  exit 1
 fi
+
+"$BINDGEN" generate \
+  --library "$HOST_LIB" \
+  --language kotlin \
+  --out-dir "$OUT_DIR/kotlin"
+
+BINDINGS_OUT="$OUT_DIR/kotlin/uniffi/yggstack_mobile/yggstack_mobile.kt"
+if [[ ! -f "$BINDINGS_OUT" ]]; then
+  echo "ERROR: uniffi-bindgen exited 0 but $BINDINGS_OUT was not written."
+  exit 1
+fi
+echo "Kotlin bindings written to $BINDINGS_OUT"
 
 echo "=== Android build complete ==="
 echo "Libraries: $OUT_DIR/jni/"
