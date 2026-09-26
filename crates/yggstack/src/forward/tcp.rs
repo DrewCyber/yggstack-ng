@@ -191,12 +191,13 @@ async fn forward_remote_tcp(
     })??;
     let (lr, mut lw) = local.into_split();
     let (mut yr, mut yw) = tokio::io::split(ygg_stream);
+    tracing::debug!("rtcp conn: relaying from ygg (local={})", target);
     tokio::select! {
-        _ = stop.recv() => {}
+        _ = stop.recv() => { tracing::debug!("rtcp conn: stop received"); }
         // ygg → local: read from the Yggdrasil leg, counts as RX
-        _ = counting_copy(&mut yr, &mut lw, entry.clone(), Dir::Rx) => {}
+        r = counting_copy(&mut yr, &mut lw, entry.clone(), Dir::Rx) => { tracing::debug!("rtcp conn: ygg→local done {:?}", r); }
         // local → ygg: written to the Yggdrasil leg, counts as TX
-        _ = counting_copy(lr, &mut yw, entry, Dir::Tx) => {}
+        r = counting_copy(lr, &mut yw, entry, Dir::Tx) => { tracing::debug!("rtcp conn: local→ygg done {:?}", r); }
     }
     Ok(())
 }

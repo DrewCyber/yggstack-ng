@@ -46,11 +46,29 @@ struct PendingConnect {
 
 // ── Listener state ────────────────────────────────────────────────────────────
 
-/// Tracks a TCP listen socket and its accept queue.
+/// Number of sockets kept in LISTEN state per listener. A smoltcp socket can
+/// run only one TCP handshake at a time: while it sits in SYN-RECEIVED a
+/// second SYN matches no listening socket and the interface answers RST,
+/// which the dialing side sees as an instant "connection refused". A pool
+/// lets concurrent handshakes proceed in parallel; every established socket
+/// moves to the accept queue and is replaced with a fresh listener.
+/// Cost: each socket preallocates 2×64 KiB buffers (1 MiB per listener).
+const LISTEN_POOL: usize = 8;
+
+/// Reap a listen-pool socket whose handshake never completed after this long.
+const SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A dropped TcpStream closes with FIN and is reaped once the socket reaches
+/// Closed. If the peer never answers the FIN the socket is removed after
+/// this grace period instead of lingering in FIN-WAIT forever.
+const CLOSE_GRACE: Duration = Duration::from_secs(60);
+
+/// Tracks a listener's socket pool and its accept queue.
 struct TcpListenerEntry {
     listen_ep: IpListenEndpoint,
-    /// The current "blank" socket waiting for a connection.
-    listen_handle: SocketHandle,
+    /// Pool of listening sockets. `syn_since` records when a socket left
+    /// LISTEN state (SYN received) so stuck half-handshakes can be reaped.
+    listen_pool: Vec<(SocketHandle, Option<SmolInstant>)>,
     /// Fully-established sockets waiting to be accepted.
     accept_queue: VecDeque<SocketHandle>,
     /// Wakers for tasks blocked on accept().
@@ -69,6 +87,9 @@ struct NetstackState {
     pending_connects: Vec<PendingConnect>,
     /// Active TCP listeners.
     listeners: Vec<TcpListenerEntry>,
+    /// Sockets whose TcpStream was dropped: closed with FIN, removed once
+    /// the close handshake completes (or CLOSE_GRACE passes).
+    closing: Vec<(SocketHandle, SmolInstant)>,
 }
 
 impl NetstackState {
@@ -93,6 +114,7 @@ impl NetstackState {
             }
         }
         self.service_listeners();
+        self.reap_closing_sockets();
         let tx: Vec<Vec<u8>> = self.device.tx_queue.drain(..).collect();
         let wakers: Vec<Waker> = std::mem::take(&mut self.wakers);
         // Periodic stats: every 500 polls (~5 sec)
@@ -154,34 +176,97 @@ impl NetstackState {
         ))
     }
 
-    /// Service all listeners: if a listening socket just got established,
-    /// move it to the accept queue and create a new blank listener.
+    /// Service all listeners: move sockets whose handshake completed to the
+    /// accept queue, reap half-handshakes stuck in SYN-RECEIVED, and keep the
+    /// pool topped up so a concurrent SYN always finds a LISTEN socket.
     fn service_listeners(&mut self) {
+        let now = smoltcp_now();
         for entry in &mut self.listeners {
-            let is_established = {
-                let socket = self.sockets.get_mut::<tcp::Socket>(entry.listen_handle);
-                socket.may_recv() && socket.may_send()
-            };
-            if is_established {
-                // Move the established socket to the accept queue.
-                entry.accept_queue.push_back(entry.listen_handle);
+            // Move established sockets to the accept queue.
+            let mut queued = false;
+            let mut i = 0;
+            while i < entry.listen_pool.len() {
+                let handle = entry.listen_pool[i].0;
+                let socket = self.sockets.get::<tcp::Socket>(handle);
+                if socket.may_recv() && socket.may_send() {
+                    tracing::debug!("listener {}: established -> accept queue", entry.listen_ep.port);
+                    entry.listen_pool.swap_remove(i);
+                    entry.accept_queue.push_back(handle);
+                    queued = true;
+                } else {
+                    i += 1;
+                }
+            }
+            if queued {
                 // Wake tasks waiting for accept().
                 for w in entry.accept_wakers.drain(..) {
                     w.wake();
                 }
-                // Create a new blank listening socket.
-                let new_handle = {
-                    let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                    let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-                    let mut sock = tcp::Socket::new(rx, tx);
-                    let _ = sock.listen(entry.listen_ep);
-                    self.sockets.add(sock)
-                };
-                entry.listen_handle = new_handle;
+            }
+            // Track and reap half-open handshakes: a SYN whose ACK never
+            // arrives would otherwise hold its pool slot forever.
+            let mut i = 0;
+            while i < entry.listen_pool.len() {
+                let handle = entry.listen_pool[i].0;
+                let listening = self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Listen;
+                if listening {
+                    entry.listen_pool[i].1 = None;
+                    i += 1;
+                    continue;
+                }
+                match entry.listen_pool[i].1 {
+                    None => {
+                        entry.listen_pool[i].1 = Some(now);
+                        i += 1;
+                    }
+                    Some(t) => {
+                        if now - t > SYN_HANDSHAKE_TIMEOUT.into() {
+                            tracing::debug!("listener {}: reaping stuck handshake", entry.listen_ep.port);
+                            self.sockets.get_mut::<tcp::Socket>(handle).abort();
+                            self.sockets.remove(handle);
+                            entry.listen_pool.swap_remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            // Top the pool back up so LISTEN_POOL sockets are in LISTEN.
+            let mut in_listen = entry
+                .listen_pool
+                .iter()
+                .filter(|(_, since)| since.is_none())
+                .count();
+            while in_listen < LISTEN_POOL {
+                entry
+                    .listen_pool
+                    .push((new_listen_socket(&mut self.sockets, entry.listen_ep), None));
+                in_listen += 1;
             }
         }
     }
 
+    /// Remove sockets queued for closing once their FIN handshake completes
+    /// (State::Closed), or force-abort them after CLOSE_GRACE so a peer that
+    /// never answers the FIN cannot leak sockets.
+    fn reap_closing_sockets(&mut self) {
+        let now = smoltcp_now();
+        let mut i = 0;
+        while i < self.closing.len() {
+            let (handle, since) = self.closing[i];
+            let done = self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Closed;
+            let expired = now - since > CLOSE_GRACE.into();
+            if done || expired {
+                if !done {
+                    self.sockets.get_mut::<tcp::Socket>(handle).abort();
+                }
+                self.sockets.remove(handle);
+                self.closing.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 // ── YggNetstack ───────────────────────────────────────────────────────────────
@@ -256,6 +341,7 @@ impl YggNetstack {
             wakers: Vec::new(),
             pending_connects: Vec::new(),
             listeners: Vec::new(),
+            closing: Vec::new(),
         }));
 
         let poll_wakeup = Arc::new(Notify::new());
@@ -448,14 +534,20 @@ impl YggNetstack {
 
         {
             let mut s = self.state.lock().unwrap();
-            let h = s.new_tcp_socket();
+            // Validate the endpoint on the first socket so listen() errors
+            // surface as before, then fill out the pool.
+            let first = s.new_tcp_socket();
             s.sockets
-                .get_mut::<tcp::Socket>(h)
+                .get_mut::<tcp::Socket>(first)
                 .listen(listen_ep)
                 .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("{:?}", e)))?;
+            let mut listen_pool = vec![(first, None)];
+            for _ in 1..LISTEN_POOL {
+                listen_pool.push((new_listen_socket(&mut s.sockets, listen_ep), None));
+            }
             s.listeners.push(TcpListenerEntry {
                 listen_ep,
-                listen_handle: h,
+                listen_pool,
                 accept_queue: VecDeque::new(),
                 accept_wakers: Vec::new(),
             });
@@ -556,10 +648,15 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         if let Ok(mut s) = self.state.lock() {
             let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
-            sock.abort();
-            let socket_count = s.sockets.iter().count();
-            s.sockets.remove(self.handle);
-            tracing::debug!("TcpStream dropped, sockets remaining: {}", socket_count - 1);
+            let state = sock.state();
+            // close() sends FIN after any queued data. abort() would send an
+            // RST that destroys data still in flight to the receiver —
+            // observed as intermittent empty responses under load, because
+            // relays drop their stream the moment one direction finishes and
+            // the RST could overtake the last data packets.
+            sock.close();
+            s.closing.push((self.handle, smoltcp_now()));
+            tracing::debug!("TcpStream dropped (state={:?}), queued for close", state);
         }
         self.poll_wakeup.notify_one();
     }
@@ -592,6 +689,7 @@ impl AsyncRead for TcpStream {
         }
 
         if !sock.may_recv() {
+            tracing::debug!("tcp read EOF: state={:?}", sock.state());
             return Poll::Ready(Ok(())); // EOF — covers all closing/closed states
         }
 
@@ -769,6 +867,15 @@ impl Drop for UdpSocket {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Create a socket in LISTEN state on the given endpoint.
+fn new_listen_socket(sockets: &mut SocketSet, ep: IpListenEndpoint) -> SocketHandle {
+    let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
+    let mut sock = tcp::Socket::new(rx, tx);
+    let _ = sock.listen(ep);
+    sockets.add(sock)
+}
 
 /// Parse an IPv4 CIDR string like "10.99.0.1/24" into a smoltcp address +
 /// prefix length.  Returns `None` on any parse error.
