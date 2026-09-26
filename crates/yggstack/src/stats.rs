@@ -13,11 +13,14 @@ use std::sync::{Arc, Mutex};
 /// Identifies the SOCKS5 proxy listener in the registry (single entry).
 pub const SOCKS_STATS_KEY: &str = "socks";
 
+/// Identifies the HTTP proxy listener in the registry (single entry).
+pub const HTTP_STATS_KEY: &str = "http";
+
 /// One listener's counters. Stored behind the registry lock; the atomics
 /// allow connection tasks to bump counters without taking that lock.
 pub struct ListenerStats {
     pub key: String,
-    pub kind: &'static str, // "socks" | "local-tcp" | "local-udp" | "remote-tcp" | "remote-udp"
+    pub kind: &'static str, // "socks" | "http" | "local-tcp" | "local-udp" | "remote-tcp" | "remote-udp"
     pub listen: String,
     pub target: String,
     pub active: AtomicI64,
@@ -43,11 +46,12 @@ impl ListenerStats {
 fn stats_kind_order(kind: &str) -> u8 {
     match kind {
         "socks" => 0,
-        "local-tcp" => 1,
-        "local-udp" => 2,
-        "remote-tcp" => 3,
-        "remote-udp" => 4,
-        _ => 5,
+        "http" => 1,
+        "local-tcp" => 2,
+        "local-udp" => 3,
+        "remote-tcp" => 4,
+        "remote-udp" => 5,
+        _ => 6,
     }
 }
 

@@ -83,6 +83,9 @@ interface YggstackMobile {
     /// Configure the SOCKS5 proxy address (call before start()).
     void set_socks(string addr);
 
+    /// Configure the HTTP proxy address (call before start()).
+    void set_http(string addr);
+
     /// Set the DNS nameserver address (call before start()).
     void set_nameserver(string addr);
 

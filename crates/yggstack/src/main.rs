@@ -15,6 +15,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use yggstack::config;
 use yggstack::forward::tcp::{spawn_local_tcp, spawn_remote_tcp};
 use yggstack::forward::udp::{spawn_local_udp, spawn_remote_udp};
+use yggstack::http_proxy::HttpProxyServer;
 use yggstack::mapping::{TcpMapping, UdpMapping};
 use yggstack::netstack::YggNetstack;
 use yggstack::resolver::NameResolver;
@@ -55,8 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     opts.optopt(
         "",
+        "http",
+        "address for HTTP proxy, e.g. :8080",
+        "ADDR",
+    );
+    opts.optopt(
+        "",
         "nameserver",
-        "Yggdrasil IPv6 address to use as DNS for SOCKS",
+        "Yggdrasil IPv6 address to use as DNS for SOCKS/HTTP",
         "ADDR",
     );
     opts.optmulti(
@@ -247,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nameserver = matches.opt_str("nameserver").unwrap_or_default();
     if nameserver.is_empty() {
-        tracing::warn!("No --nameserver set; SOCKS5 hostname resolution will only work for .pk.ygg");
+        tracing::warn!("No --nameserver set; SOCKS5/HTTP hostname resolution will only work for .pk.ygg");
     }
     let resolver = Arc::new(NameResolver::new(netstack.clone(), &nameserver));
 
@@ -271,6 +278,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             if let Err(e) = server.serve_tcp(&addr2, stop_clone, stats_socks).await {
                 tracing::error!("SOCKS5 server error: {}", e);
+            }
+        });
+    }
+
+    // ── HTTP proxy server ─────────────────────────────────────────────────────
+
+    if let Some(http_addr) = matches.opt_str("http") {
+        let addr = if http_addr.starts_with(':') {
+            format!("0.0.0.0{}", http_addr)
+        } else {
+            http_addr
+        };
+        let server = Arc::new(HttpProxyServer::new(netstack.clone(), resolver.clone()));
+        let addr2 = addr.clone();
+        let stop_clone = stop_tx.clone();
+        let stats_http = stats.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.serve_tcp(&addr2, stop_clone, stats_http).await {
+                tracing::error!("HTTP proxy server error: {}", e);
             }
         });
     }

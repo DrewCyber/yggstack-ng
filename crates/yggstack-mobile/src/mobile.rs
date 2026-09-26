@@ -7,6 +7,7 @@ use yggdrasil::ipv6rwc::ReadWriteCloser;
 use yggstack::config;
 use yggstack::forward::tcp::{local_tcp_key, remote_tcp_key, spawn_local_tcp, spawn_remote_tcp};
 use yggstack::forward::udp::{local_udp_key, remote_udp_key, spawn_local_udp, spawn_remote_udp};
+use yggstack::http_proxy::HttpProxyServer;
 use yggstack::mapping::{TcpMapping, UdpMapping};
 use yggstack::netstack::YggNetstack;
 use yggstack::resolver::NameResolver;
@@ -146,6 +147,7 @@ struct NodeState {
     stop_tx: tokio::sync::broadcast::Sender<()>,
     stats: Arc<ListenerStatsRegistry>,
     socks_handle: Option<tokio::task::JoinHandle<()>>,
+    http_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// A listener started for one mapping; firing `stop_tx` stops it and
@@ -176,6 +178,7 @@ pub struct YggstackMobile {
     state: Mutex<Option<NodeState>>,
     cfg: Mutex<Option<yggdrasil::config::Config>>,
     socks_addr: Mutex<Option<String>>,
+    http_addr: Mutex<Option<String>>,
     nameserver: Mutex<String>,
     local_tcp: Mutex<Vec<TcpMapping>>,
     local_udp: Mutex<Vec<UdpMapping>>,
@@ -204,6 +207,7 @@ impl YggstackMobile {
             state: Mutex::new(None),
             cfg: Mutex::new(None),
             socks_addr: Mutex::new(None),
+            http_addr: Mutex::new(None),
             nameserver: Mutex::new(String::new()),
             local_tcp: Mutex::new(Vec::new()),
             local_udp: Mutex::new(Vec::new()),
@@ -307,6 +311,7 @@ impl YggstackMobile {
             .map_err(YggstackError::Config)?;
 
         let socks_addr = self.socks_addr.lock().unwrap().clone();
+        let http_addr = self.http_addr.lock().unwrap().clone();
         let nameserver = self.nameserver.lock().unwrap().clone();
         let local_tcp = self.local_tcp.lock().unwrap().clone();
         let local_udp = self.local_udp.lock().unwrap().clone();
@@ -367,6 +372,19 @@ impl YggstackMobile {
                 }));
             }
 
+            let mut http_handle = None;
+            if let Some(addr) = http_addr {
+                let srv = Arc::new(HttpProxyServer::new(netstack.clone(), resolver.clone()));
+                let a2 = addr.clone();
+                let stop_clone = stop_tx.clone();
+                let stats2 = stats.clone();
+                http_handle = Some(tokio::spawn(async move {
+                    if let Err(e) = srv.serve_tcp(&a2, stop_clone, stats2).await {
+                        tracing::error!("HTTP proxy: {}", e);
+                    }
+                }));
+            }
+
             let mut listeners = self.listeners.lock().unwrap();
             for m in local_tcp  { self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| spawn_local_tcp(ns, m, tx, st));  }
             for m in local_udp  { self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| spawn_local_udp(ns, m, tx, st));  }
@@ -380,6 +398,7 @@ impl YggstackMobile {
                 stop_tx,
                 stats,
                 socks_handle,
+                http_handle,
             }
         });
 
@@ -399,10 +418,13 @@ impl YggstackMobile {
             // of all forwarded connections after a stop/start cycle).
             let _ = self.rt.block_on(node.core.close());
             let _ = node.stop_tx.send(());
-            // Join the SOCKS server so the proxy port is released before
-            // stop() returns (Go joins all workers in Stop()).
+            // Join the SOCKS/HTTP servers so the proxy ports are released
+            // before stop() returns (Go joins all workers in Stop()).
             if let Some(mut socks) = node.socks_handle {
                 self.rt.block_on(join_listener(&mut socks));
+            }
+            if let Some(mut http) = node.http_handle {
+                self.rt.block_on(join_listener(&mut http));
             }
         }
         // Stop and JOIN every per-mapping listener so their listening
@@ -426,6 +448,10 @@ impl YggstackMobile {
 
     pub fn set_socks(&self, addr: String) {
         *self.socks_addr.lock().unwrap() = if addr.is_empty() { None } else { Some(addr) };
+    }
+
+    pub fn set_http(&self, addr: String) {
+        *self.http_addr.lock().unwrap() = if addr.is_empty() { None } else { Some(addr) };
     }
 
     pub fn set_nameserver(&self, addr: String) {
