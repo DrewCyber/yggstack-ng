@@ -164,6 +164,11 @@ struct RunningListener {
 /// Grace period for a listener task to exit after stop before aborting it.
 const LISTENER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Grace period for the runtime shutdown in Drop: how long to wait for the
+/// remaining tasks (core proto tasks, relay stragglers) to be dropped before
+/// the runtime is torn down regardless.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn join_listener(handle: &mut tokio::task::JoinHandle<()>) {
     if tokio::time::timeout(LISTENER_STOP_GRACE, &mut *handle).await.is_err() {
         handle.abort();
@@ -174,7 +179,7 @@ async fn join_listener(handle: &mut tokio::task::JoinHandle<()>) {
 // ── YggstackMobile ────────────────────────────────────────────────────────────
 
 pub struct YggstackMobile {
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: tokio::runtime::Runtime,
     state: Mutex<Option<NodeState>>,
     cfg: Mutex<Option<yggdrasil::config::Config>>,
     socks_addr: Mutex<Option<String>>,
@@ -203,7 +208,7 @@ impl YggstackMobile {
             .build()
             .expect("failed to create tokio runtime");
         Self {
-            rt: Arc::new(rt),
+            rt,
             state: Mutex::new(None),
             cfg: Mutex::new(None),
             socks_addr: Mutex::new(None),
@@ -426,6 +431,10 @@ impl YggstackMobile {
             if let Some(mut http) = node.http_handle {
                 self.rt.block_on(join_listener(&mut http));
             }
+            // Shut the netstack down: fail pending dials and reads, join its
+            // background tasks. Without this, dial stragglers keep running on
+            // the old runtime for up to CONNECT_TIMEOUT after stop().
+            self.rt.block_on(node.netstack.shutdown());
         }
         // Stop and JOIN every per-mapping listener so their listening
         // sockets are closed before stop() returns — an immediate restart
@@ -675,5 +684,23 @@ impl YggstackMobile {
             })
             .collect();
         format!("[{}]", items.join(","))
+    }
+}
+
+impl Drop for YggstackMobile {
+    fn drop(&mut self) {
+        // Safety net for a dropped-without-stop engine: quiesce it, then tear
+        // the runtime down with a bound so nothing outlives the object. The
+        // app is expected to destroy the engine deterministically at stop()
+        // (via the uniffi destroy()); relying on the JVM cleaner instead
+        // frees the runtime at an arbitrary GC moment — racing a new engine
+        // constructed in the same process (native crash on start-after-stop).
+        self.stop();
+        let placeholder = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create placeholder runtime");
+        let rt = std::mem::replace(&mut self.rt, placeholder);
+        rt.shutdown_timeout(SHUTDOWN_GRACE);
     }
 }

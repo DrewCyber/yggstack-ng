@@ -77,6 +77,12 @@ struct TcpListenerEntry {
 
 // ── Netstack shared state ─────────────────────────────────────────────────────
 
+/// Lock the netstack state, tolerating a poisoned mutex — a panicking task
+/// must not turn later teardown (Drop paths, shutdown) into a process abort.
+fn lock_state(state: &Mutex<NetstackState>) -> std::sync::MutexGuard<'_, NetstackState> {
+    state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct NetstackState {
     iface: Interface,
     device: YggDevice,
@@ -90,6 +96,9 @@ struct NetstackState {
     /// Sockets whose TcpStream was dropped: closed with FIN, removed once
     /// the close handshake completes (or CLOSE_GRACE passes).
     closing: Vec<(SocketHandle, SmolInstant)>,
+    /// Set by YggNetstack::shutdown(): the poll loop exits and every
+    /// in-flight socket operation fails instead of pending.
+    closed: bool,
 }
 
 impl NetstackState {
@@ -280,6 +289,8 @@ pub struct YggNetstack {
     state: Arc<Mutex<NetstackState>>,
     /// Signal the poll loop to run immediately.
     poll_wakeup: Arc<Notify>,
+    /// Background task handles, joined by [YggNetstack::shutdown].
+    tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     pub our_addr: Ipv6Addr,
     pub mtu: usize,
 }
@@ -342,6 +353,7 @@ impl YggNetstack {
             pending_connects: Vec::new(),
             listeners: Vec::new(),
             closing: Vec::new(),
+            closed: false,
         }));
 
         let poll_wakeup = Arc::new(Notify::new());
@@ -349,6 +361,7 @@ impl YggNetstack {
         let ns = Arc::new(Self {
             state: state.clone(),
             poll_wakeup: poll_wakeup.clone(),
+            tasks: Mutex::new(None),
             our_addr,
             mtu,
         });
@@ -360,7 +373,7 @@ impl YggNetstack {
     fn spawn_tasks(self: &Arc<Self>, rwc: Arc<ReadWriteCloser>) {
         // Task 1: continuously read from RWC → queue packets for smoltcp.
         let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
-        {
+        let reader = {
             let rwc2 = rwc.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
@@ -375,21 +388,25 @@ impl YggNetstack {
                         Err(_) => break,
                     }
                 }
-            });
-        }
+            })
+        };
 
         // Task 2: smoltcp poll loop.
         let state = self.state.clone();
         let poll_wakeup = self.poll_wakeup.clone();
         let mut frag_reassembler = FragReassembler::new();
 
-        tokio::spawn(async move {
+        let poller = tokio::spawn(async move {
             loop {
                 // Determine how long to sleep before the next forced poll.
-                let delay_ms: u64 = {
-                    let mut s = state.lock().unwrap();
-                    s.poll_delay_ms()
+                // Exit promptly once the netstack is shut down.
+                let (closed, delay_ms) = {
+                    let mut s = lock_state(&state);
+                    (s.closed, s.poll_delay_ms())
                 };
+                if closed {
+                    break;
+                }
 
                 // Wait for a new packet, the timeout, or an explicit wakeup.
                 tokio::select! {
@@ -397,7 +414,7 @@ impl YggNetstack {
                         match maybe {
                             Some(pkt) => {
                                 if let Some(reassembled) = frag_reassembler.feed(pkt) {
-                                    let mut s = state.lock().unwrap();
+                                    let mut s = lock_state(&state);
                                     s.device.rx_queue.push_back(reassembled);
                                 }
                             }
@@ -411,14 +428,14 @@ impl YggNetstack {
                 // Drain any additional packets that arrived concurrently.
                 while let Ok(pkt) = pkt_rx.try_recv() {
                     if let Some(reassembled) = frag_reassembler.feed(pkt) {
-                        let mut s = state.lock().unwrap();
+                        let mut s = lock_state(&state);
                         s.device.rx_queue.push_back(reassembled);
                     }
                 }
 
                 // Run smoltcp, collect outgoing packets and wakers.
                 let (tx_pkts, wakers) = {
-                    let mut s = state.lock().unwrap();
+                    let mut s = lock_state(&state);
                     s.process_connects();
                     s.run_poll()
                 };
@@ -434,6 +451,56 @@ impl YggNetstack {
                 }
             }
         });
+
+        *self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(vec![reader, poller]);
+    }
+
+    /// Shut the netstack down: every in-flight socket operation fails, dial
+    /// stragglers are released instead of living out their connect timeout,
+    /// and the background tasks are joined. Idempotent; called from engine
+    /// stop() so nothing from an old engine generation keeps running.
+    pub async fn shutdown(&self) {
+        let wakers = {
+            let mut s = lock_state(&self.state);
+            s.closed = true;
+            // Fail queued connect commands: dropping the senders breaks the
+            // dialers' oneshot channels.
+            s.pending_connects.clear();
+            // Wake everything blocked on a socket event so blocked reads,
+            // writes and accepts re-poll instead of pending forever.
+            let mut wakers: Vec<Waker> = std::mem::take(&mut s.wakers);
+            for entry in &mut s.listeners {
+                wakers.append(&mut entry.accept_wakers);
+            }
+            // Abort every TCP socket: pending wait_connected()/poll_read see
+            // the Closed state and return an error.
+            let tcp_handles: Vec<SocketHandle> = s
+                .sockets
+                .iter()
+                .filter(|(_, sock)| matches!(sock, Socket::Tcp(_)))
+                .map(|(h, _)| h)
+                .collect();
+            for h in tcp_handles {
+                s.sockets.get_mut::<tcp::Socket>(h).abort();
+            }
+            s.listeners.clear();
+            s.closing.clear();
+            wakers
+        };
+        for w in wakers {
+            w.wake();
+        }
+        self.poll_wakeup.notify_one();
+
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(tasks) = tasks {
+            for mut task in tasks {
+                join_with_grace(&mut task).await;
+            }
+        }
     }
 
     // ── Public dial / listen API ──────────────────────────────────────────────
@@ -466,14 +533,14 @@ impl YggNetstack {
 
         // Create TCP socket.
         let handle = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             s.new_tcp_socket()
         };
 
         // Queue the connect command for the poll loop.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             s.pending_connects.push(PendingConnect {
                 handle,
                 remote: remote_ep,
@@ -533,7 +600,7 @@ impl YggNetstack {
         };
 
         {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             // Validate the endpoint on the first socket so listen() errors
             // surface as before, then fill out the pool.
             let first = s.new_tcp_socket();
@@ -569,7 +636,7 @@ impl YggNetstack {
         };
 
         let handle = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             let h = s.new_udp_socket();
             s.sockets
                 .get_mut::<udp::Socket>(h)
@@ -589,7 +656,7 @@ impl YggNetstack {
     /// sending to a remote Yggdrasil address and receiving replies.
     pub fn open_udp(&self) -> io::Result<UdpSocket> {
         let handle = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             let h = s.new_udp_socket();
             // smoltcp requires a socket to be bound before it can send; pick a
             // random ephemeral local port (bind addr = None means any interface).
@@ -624,7 +691,7 @@ impl TcpStream {
     /// Wait until the socket reaches ESTABLISHED state.
     async fn wait_connected(&self) -> io::Result<()> {
         std::future::poll_fn(|cx| {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             let sock = s.sockets.get::<tcp::Socket>(self.handle);
             match sock.state() {
                 tcp::State::Established => Poll::Ready(Ok(())),
@@ -646,7 +713,8 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.state.lock() {
+        {
+            let mut s = lock_state(&self.state);
             let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
             let state = sock.state();
             // close() sends FIN after any queued data. abort() would send an
@@ -668,7 +736,7 @@ impl AsyncRead for TcpStream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = lock_state(&self.state);
         let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
 
         if sock.can_recv() {
@@ -704,7 +772,7 @@ impl AsyncWrite for TcpStream {
         cx: &mut TaskContext<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = lock_state(&self.state);
         let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
 
         if !sock.may_send() {
@@ -740,7 +808,7 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = lock_state(&self.state);
         s.sockets.get_mut::<tcp::Socket>(self.handle).close();
         drop(s);
         self.poll_wakeup.notify_one();
@@ -762,7 +830,7 @@ impl TcpListener {
         let state = self.state.clone();
         let poll_wakeup = self.poll_wakeup.clone();
         std::future::poll_fn(move |cx| {
-            let mut s = state.lock().unwrap();
+            let mut s = lock_state(&state);
             let idx = s.listeners.iter().position(|e| e.listen_ep.port == port);
             if let Some(i) = idx {
                 if let Some(handle) = s.listeners[i].accept_queue.pop_front() {
@@ -792,7 +860,7 @@ pub struct UdpSocket {
 impl UdpSocket {
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         std::future::poll_fn(|cx| {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             let sock = s.sockets.get_mut::<udp::Socket>(self.handle);
             if sock.can_recv() {
                 return Poll::Ready(match sock.recv_slice(buf) {
@@ -839,7 +907,7 @@ impl UdpSocket {
         let endpoint = IpEndpoint::new(IpAddress::Ipv6(target_ip), target.port());
 
         std::future::poll_fn(|cx| {
-            let mut s = self.state.lock().unwrap();
+            let mut s = lock_state(&self.state);
             let sock = s.sockets.get_mut::<udp::Socket>(self.handle);
             if sock.can_send() {
                 return Poll::Ready(match sock.send_slice(buf, endpoint) {
@@ -860,13 +928,19 @@ impl UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.state.lock() {
-            s.sockets.remove(self.handle);
-        }
+        lock_state(&self.state).sockets.remove(self.handle);
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Wait for a background task to finish with a grace period, then abort it.
+async fn join_with_grace(handle: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(2), &mut *handle).await.is_err() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
 
 /// Create a socket in LISTEN state on the given endpoint.
 fn new_listen_socket(sockets: &mut SocketSet, ep: IpListenEndpoint) -> SocketHandle {
