@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optopt(
         "",
         "nameserver",
-        "Yggdrasil IPv6 address to use as DNS for SOCKS/HTTP",
+        "Yggdrasil IPv6 address to use as DNS for SOCKS/HTTP; comma-separated servers are tried in order with failover",
         "ADDR",
     );
     opts.optmulti(

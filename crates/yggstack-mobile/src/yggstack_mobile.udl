@@ -86,7 +86,8 @@ interface YggstackMobile {
     /// Configure the HTTP proxy address (call before start()).
     void set_http(string addr);
 
-    /// Set the DNS nameserver address (call before start()).
+    /// Set the DNS nameserver address (call before start()). A single
+    /// address or a comma-separated list tried in order with failover.
     void set_nameserver(string addr);
 
     /// Add a local-tcp forwarding spec, e.g. "8080:[addr]:80".
