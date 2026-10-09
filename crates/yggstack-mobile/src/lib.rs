@@ -4,10 +4,6 @@ mod mobile;
 mod quic_check;
 
 pub use mobile::{
-    YggstackError,
+    check_quic_peer, generate_config, get_version, LogCallback, PingCallback, YggstackError,
     YggstackMobile,
-    LogCallback,
-    generate_config,
-    get_version,
-    check_quic_peer,
 };

@@ -1,5 +1,7 @@
 //! UniFFI mobile bindings for yggstack.
+use std::net::Ipv6Addr;
 use std::sync::{Arc, Mutex, Once};
+use std::time::Duration;
 
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
@@ -10,6 +12,7 @@ use yggstack::forward::udp::{local_udp_key, remote_udp_key, spawn_local_udp, spa
 use yggstack::http_proxy::HttpProxyServer;
 use yggstack::mapping::{TcpMapping, UdpMapping};
 use yggstack::netstack::YggNetstack;
+use yggstack::ping::{self, PingDoneReason, PingEvent};
 use yggstack::resolver::NameResolver;
 use yggstack::socks::Socks5Server;
 use yggstack::stats::ListenerStatsRegistry;
@@ -121,6 +124,62 @@ pub trait LogCallback: Send + Sync {
     fn on_log(&self, message: String);
 }
 
+// ── PingCallback (UniFFI callback interface) ─────────────────────────────────
+
+pub trait PingCallback: Send + Sync {
+    fn on_result(&self, result: String);
+}
+
+/// Render one [PingEvent] as the JSON protocol shared with the Go engine.
+fn ping_event_json(ev: PingEvent) -> String {
+    match ev {
+        PingEvent::Probe { seq, rtt, error } => match rtt {
+            Some(rtt) => format!(
+                r#"{{"Type":"probe","Seq":{seq},"Success":true,"RttMs":{:.2}}}"#,
+                rtt.as_secs_f64() * 1000.0
+            ),
+            None => format!(
+                r#"{{"Type":"probe","Seq":{seq},"Success":false,"Error":"{}"}}"#,
+                error.as_deref().unwrap_or("timeout")
+            ),
+        },
+        PingEvent::Done { reason } => {
+            let reason = match reason {
+                PingDoneReason::Completed => "completed",
+                PingDoneReason::Stopped => "stopped",
+                PingDoneReason::Failed => "error",
+            };
+            format!(r#"{{"Type":"done","Reason":"{reason}"}}"#)
+        }
+    }
+}
+
+/// A running ping session: firing `stop_tx` cancels the probe loop and
+/// `handle` lets stop_ping() join the task so no callback event can race a
+/// newly started session.
+struct PingSession {
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Grace period for a ping task to exit after stop before aborting it.
+const PING_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Future that resolves once the watch channel reports `true` (or its
+/// sender is dropped, which also ends the session).
+fn watch_stop(mut rx: tokio::sync::watch::Receiver<bool>) -> impl std::future::Future<Output = ()> {
+    async move {
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 // ── Namespace functions ───────────────────────────────────────────────────────
 
 pub fn generate_config() -> String {
@@ -170,7 +229,10 @@ const LISTENER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 async fn join_listener(handle: &mut tokio::task::JoinHandle<()>) {
-    if tokio::time::timeout(LISTENER_STOP_GRACE, &mut *handle).await.is_err() {
+    if tokio::time::timeout(LISTENER_STOP_GRACE, &mut *handle)
+        .await
+        .is_err()
+    {
         handle.abort();
         let _ = handle.await;
     }
@@ -192,6 +254,8 @@ pub struct YggstackMobile {
     /// Live listeners for the current run, keyed by the same stats key the
     /// forwarders register under. Empty when the node is not running.
     listeners: Mutex<std::collections::HashMap<String, RunningListener>>,
+    /// The running ping session, if any.
+    ping: Mutex<Option<PingSession>>,
 }
 
 impl Default for YggstackMobile {
@@ -219,6 +283,7 @@ impl YggstackMobile {
             remote_tcp: Mutex::new(Vec::new()),
             remote_udp: Mutex::new(Vec::new()),
             listeners: Mutex::new(std::collections::HashMap::new()),
+            ping: Mutex::new(None),
         }
     }
 
@@ -240,8 +305,8 @@ impl YggstackMobile {
     }
 
     pub fn load_config(&self, toml_config: String) -> Result<(), YggstackError> {
-        let mut cfg: yggdrasil::config::Config = toml::from_str(&toml_config)
-            .map_err(|e| YggstackError::Config(e.to_string()))?;
+        let mut cfg: yggdrasil::config::Config =
+            toml::from_str(&toml_config).map_err(|e| YggstackError::Config(e.to_string()))?;
         cfg.if_name = "none".to_string();
         cfg.admin_listen = "none".to_string();
         *self.cfg.lock().unwrap() = Some(cfg);
@@ -265,9 +330,7 @@ impl YggstackMobile {
         let cfg = guard
             .as_ref()
             .ok_or_else(|| YggstackError::Config("no config loaded".to_string()))?;
-        let key = cfg
-            .signing_key()
-            .map_err(YggstackError::Config)?;
+        let key = cfg.signing_key().map_err(YggstackError::Config)?;
         let pk = key.verifying_key().to_bytes();
         Ok(config::addr_for_key(&pk).to_string())
     }
@@ -277,9 +340,7 @@ impl YggstackMobile {
         let cfg = guard
             .as_ref()
             .ok_or_else(|| YggstackError::Config("no config loaded".to_string()))?;
-        let key = cfg
-            .signing_key()
-            .map_err(YggstackError::Config)?;
+        let key = cfg.signing_key().map_err(YggstackError::Config)?;
         let pk = key.verifying_key().to_bytes();
         let (ip, pfx) = config::subnet_for_key(&pk);
         Ok(format!("{}/{}", ip, pfx))
@@ -290,9 +351,7 @@ impl YggstackMobile {
         let cfg = guard
             .as_ref()
             .ok_or_else(|| YggstackError::Config("no config loaded".to_string()))?;
-        let key = cfg
-            .signing_key()
-            .map_err(YggstackError::Config)?;
+        let key = cfg.signing_key().map_err(YggstackError::Config)?;
         Ok(hex::encode(key.verifying_key().to_bytes()))
     }
 
@@ -311,9 +370,7 @@ impl YggstackMobile {
                 .ok_or_else(|| YggstackError::Config("no config loaded".to_string()))?
         };
 
-        let signing_key = cfg
-            .signing_key()
-            .map_err(YggstackError::Config)?;
+        let signing_key = cfg.signing_key().map_err(YggstackError::Config)?;
 
         let socks_addr = self.socks_addr.lock().unwrap().clone();
         let http_addr = self.http_addr.lock().unwrap().clone();
@@ -391,10 +448,26 @@ impl YggstackMobile {
             }
 
             let mut listeners = self.listeners.lock().unwrap();
-            for m in local_tcp  { self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| spawn_local_tcp(ns, m, tx, st));  }
-            for m in local_udp  { self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| spawn_local_udp(ns, m, tx, st));  }
-            for m in remote_tcp { self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| spawn_remote_tcp(ns, m, tx, st)); }
-            for m in remote_udp { self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| spawn_remote_udp(ns, m, tx, st)); }
+            for m in local_tcp {
+                self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| {
+                    spawn_local_tcp(ns, m, tx, st)
+                });
+            }
+            for m in local_udp {
+                self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| {
+                    spawn_local_udp(ns, m, tx, st)
+                });
+            }
+            for m in remote_tcp {
+                self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| {
+                    spawn_remote_tcp(ns, m, tx, st)
+                });
+            }
+            for m in remote_udp {
+                self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| {
+                    spawn_remote_udp(ns, m, tx, st)
+                });
+            }
 
             NodeState {
                 core,
@@ -412,6 +485,9 @@ impl YggstackMobile {
     }
 
     pub fn stop(&self) {
+        // End the ping session first so its task and callback events stop
+        // before the node (and with it the netstack) is torn down.
+        self.stop_ping();
         let node = { self.state.lock().unwrap().take() };
         if let Some(node) = node {
             self.rt.block_on(node.core.close_multicast());
@@ -476,59 +552,71 @@ impl YggstackMobile {
         netstack: &Arc<YggNetstack>,
         stats: &Arc<ListenerStatsRegistry>,
         mapping: M,
-        spawn_fn: impl Fn(Arc<YggNetstack>, M, Arc<ListenerStatsRegistry>, tokio::sync::broadcast::Sender<()>) -> (String, tokio::task::JoinHandle<()>),
+        spawn_fn: impl Fn(
+            Arc<YggNetstack>,
+            M,
+            Arc<ListenerStatsRegistry>,
+            tokio::sync::broadcast::Sender<()>,
+        ) -> (String, tokio::task::JoinHandle<()>),
     ) {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         let (key, handle) = spawn_fn(netstack.clone(), mapping, stats.clone(), tx.clone());
         // Keep `rx` alive so a stop fired before the task first polls its own
         // subscription is not lost to a zero-receiver send.
-        listeners.insert(key, RunningListener { _rx: rx, stop_tx: tx, handle });
+        listeners.insert(
+            key,
+            RunningListener {
+                _rx: rx,
+                stop_tx: tx,
+                handle,
+            },
+        );
     }
 
     pub fn add_local_tcp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = TcpMapping::parse_local(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = TcpMapping::parse_local(&spec).map_err(YggstackError::Config)?;
         self.local_tcp.lock().unwrap().push(m.clone());
         if let Some(node) = self.state.lock().unwrap().as_ref() {
             let mut ls = self.listeners.lock().unwrap();
-            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m,
-                |ns, m, st, tx| spawn_local_tcp(ns, m, tx, st));
+            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
+                spawn_local_tcp(ns, m, tx, st)
+            });
         }
         Ok(())
     }
 
     pub fn add_local_udp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = UdpMapping::parse_local(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = UdpMapping::parse_local(&spec).map_err(YggstackError::Config)?;
         self.local_udp.lock().unwrap().push(m.clone());
         if let Some(node) = self.state.lock().unwrap().as_ref() {
             let mut ls = self.listeners.lock().unwrap();
-            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m,
-                |ns, m, st, tx| spawn_local_udp(ns, m, tx, st));
+            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
+                spawn_local_udp(ns, m, tx, st)
+            });
         }
         Ok(())
     }
 
     pub fn add_remote_tcp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = TcpMapping::parse_remote(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = TcpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
         self.remote_tcp.lock().unwrap().push(m.clone());
         if let Some(node) = self.state.lock().unwrap().as_ref() {
             let mut ls = self.listeners.lock().unwrap();
-            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m,
-                |ns, m, st, tx| spawn_remote_tcp(ns, m, tx, st));
+            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
+                spawn_remote_tcp(ns, m, tx, st)
+            });
         }
         Ok(())
     }
 
     pub fn add_remote_udp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = UdpMapping::parse_remote(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = UdpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
         self.remote_udp.lock().unwrap().push(m.clone());
         if let Some(node) = self.state.lock().unwrap().as_ref() {
             let mut ls = self.listeners.lock().unwrap();
-            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m,
-                |ns, m, st, tx| spawn_remote_udp(ns, m, tx, st));
+            self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
+                spawn_remote_udp(ns, m, tx, st)
+            });
         }
         Ok(())
     }
@@ -536,37 +624,45 @@ impl YggstackMobile {
     /// Remove a single local-tcp mapping. Stops its listener when the node is
     /// running; the mapping is dropped from the next start() either way.
     pub fn remove_local_tcp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = TcpMapping::parse_local(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = TcpMapping::parse_local(&spec).map_err(YggstackError::Config)?;
         let key = local_tcp_key(&m);
-        self.local_tcp.lock().unwrap().retain(|x| local_tcp_key(x) != key);
+        self.local_tcp
+            .lock()
+            .unwrap()
+            .retain(|x| local_tcp_key(x) != key);
         self.stop_listener(&key);
         Ok(())
     }
 
     pub fn remove_local_udp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = UdpMapping::parse_local(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = UdpMapping::parse_local(&spec).map_err(YggstackError::Config)?;
         let key = local_udp_key(&m);
-        self.local_udp.lock().unwrap().retain(|x| local_udp_key(x) != key);
+        self.local_udp
+            .lock()
+            .unwrap()
+            .retain(|x| local_udp_key(x) != key);
         self.stop_listener(&key);
         Ok(())
     }
 
     pub fn remove_remote_tcp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = TcpMapping::parse_remote(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = TcpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
         let key = remote_tcp_key(&m);
-        self.remote_tcp.lock().unwrap().retain(|x| remote_tcp_key(x) != key);
+        self.remote_tcp
+            .lock()
+            .unwrap()
+            .retain(|x| remote_tcp_key(x) != key);
         self.stop_listener(&key);
         Ok(())
     }
 
     pub fn remove_remote_udp(&self, spec: String) -> Result<(), YggstackError> {
-        let m = UdpMapping::parse_remote(&spec)
-            .map_err(YggstackError::Config)?;
+        let m = UdpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
         let key = remote_udp_key(&m);
-        self.remote_udp.lock().unwrap().retain(|x| remote_udp_key(x) != key);
+        self.remote_udp
+            .lock()
+            .unwrap()
+            .retain(|x| remote_udp_key(x) != key);
         self.stop_listener(&key);
         Ok(())
     }
@@ -684,6 +780,72 @@ impl YggstackMobile {
             })
             .collect();
         format!("[{}]", items.join(","))
+    }
+
+    /// Start an ICMPv6 ping session to a Yggdrasil address (see the UDL for
+    /// the event protocol). Replaces any running session.
+    pub fn start_ping(
+        &self,
+        address: String,
+        count: i32,
+        timeout_ms: i64,
+        interval_ms: i64,
+        callback: Box<dyn PingCallback>,
+    ) -> Result<(), YggstackError> {
+        let dst: Ipv6Addr = address
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse()
+            .map_err(|_| YggstackError::Config(format!("invalid IPv6 address: {address}")))?;
+        if !ping::is_ygg_address(&dst) {
+            return Err(YggstackError::Config(
+                "not a Yggdrasil address (must be within 200::/7)".to_string(),
+            ));
+        }
+        let count = count.max(0) as u32;
+        let timeout = Duration::from_millis(timeout_ms.clamp(50, 60_000) as u64);
+        let interval = Duration::from_millis(interval_ms.clamp(0, 60_000) as u64);
+
+        let netstack = {
+            let guard = self.state.lock().unwrap();
+            guard
+                .as_ref()
+                .map(|n| n.netstack.clone())
+                .ok_or_else(|| YggstackError::NotRunning("not running".to_string()))?
+        };
+
+        // Replace a running session: join it so its final events are
+        // delivered before this session starts probing.
+        self.stop_ping();
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = self.rt.spawn(async move {
+            let stop = watch_stop(stop_rx);
+            ping::run_ping(&netstack, dst, count, timeout, interval, stop, move |ev| {
+                callback.on_result(ping_event_json(ev));
+            })
+            .await;
+        });
+        *self.ping.lock().unwrap() = Some(PingSession { stop_tx, handle });
+        Ok(())
+    }
+
+    /// Stop the running ping session, if any. Joins the task so no further
+    /// callback events fire after this returns.
+    pub fn stop_ping(&self) {
+        let Some(mut session) = self.ping.lock().unwrap().take() else {
+            return;
+        };
+        let _ = session.stop_tx.send(true);
+        self.rt.block_on(async {
+            if tokio::time::timeout(PING_STOP_GRACE, &mut session.handle)
+                .await
+                .is_err()
+            {
+                session.handle.abort();
+                let _ = session.handle.await;
+            }
+        });
     }
 }
 

@@ -25,6 +25,10 @@ callback interface LogCallback {
     void on_log(string message);
 };
 
+callback interface PingCallback {
+    void on_result(string result);
+};
+
 // ── Main interface ────────────────────────────────────────────────────────────
 
 interface YggstackMobile {
@@ -135,4 +139,21 @@ interface YggstackMobile {
     /// "Target","ActiveConns","TotalConns","RXBytes","TXBytes"}].
     /// Returns "[]" when not running.
     string get_listeners_json();
+
+    /// Start an ICMPv6 ping session to a Yggdrasil address (200::/7),
+    /// sending `count` probes (0 = until stopped) every `interval_ms` ms,
+    /// each waiting up to `timeout_ms` for its reply. Every probe result
+    /// and the session end are reported through `callback` as JSON events:
+    ///   {"Type":"probe","Seq":1,"Success":true,"RttMs":12.3}
+    ///   {"Type":"probe","Seq":2,"Success":false,"Error":"timeout"}
+    ///   {"Type":"done","Reason":"completed"|"stopped"|"error"}
+    /// The first probe to an unknown destination may be delayed by the
+    /// overlay's key lookup and time out — it is reported as-is.
+    /// Replaces any running session. Requires a running node.
+    [Throws=YggstackError]
+    void start_ping(string address, i32 count, i64 timeout_ms, i64 interval_ms, PingCallback callback);
+
+    /// Stop the running ping session (if any). Its callback receives a
+    /// final {"Type":"done","Reason":"stopped"} event.
+    void stop_ping();
 };

@@ -3,6 +3,7 @@ pub mod forward;
 pub mod http_proxy;
 pub mod mapping;
 pub mod netstack;
+pub mod ping;
 pub mod resolver;
 pub mod socks;
 pub mod stats;

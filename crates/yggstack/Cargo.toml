@@ -36,6 +36,7 @@ smoltcp = { version = "0.11", features = [
     "fragmentation-buffer-size-65536",
     "socket-tcp",
     "socket-udp",
+    "socket-icmp",
     "alloc",
 ] }
 

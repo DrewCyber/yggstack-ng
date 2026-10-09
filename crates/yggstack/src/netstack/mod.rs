@@ -7,13 +7,16 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::task::{Context as TaskContext, Poll, Waker};
+use std::time::Duration;
 
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{tcp, udp, Socket};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::socket::{icmp, tcp, udp, Socket};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv6Address, Ipv6Cidr};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv6Address, Ipv6Cidr,
+};
 #[cfg(feature = "ckr")]
 use smoltcp::wire::{Ipv4Address, Ipv4Cidr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -127,7 +130,10 @@ impl NetstackState {
         let tx: Vec<Vec<u8>> = self.device.tx_queue.drain(..).collect();
         let wakers: Vec<Waker> = std::mem::take(&mut self.wakers);
         // Periodic stats: every 500 polls (~5 sec)
-        if POLL_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(500) {
+        if POLL_COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(500)
+        {
             let mut tcp_count = 0u32;
             let mut udp_count = 0u32;
             for (_, socket) in self.sockets.iter() {
@@ -145,8 +151,12 @@ impl NetstackState {
                 .unwrap_or(0);
             tracing::info!(
                 "[b{}] netstack: rss={}MB tcp={} udp={} rx_q={} tx_q={} wakers={}",
-                crate::BUILD_NUM, rss_mb, tcp_count, udp_count,
-                self.device.rx_queue.len(), tx.len(),
+                crate::BUILD_NUM,
+                rss_mb,
+                tcp_count,
+                udp_count,
+                self.device.rx_queue.len(),
+                tx.len(),
                 wakers.len(),
             );
         }
@@ -198,7 +208,10 @@ impl NetstackState {
                 let handle = entry.listen_pool[i].0;
                 let socket = self.sockets.get::<tcp::Socket>(handle);
                 if socket.may_recv() && socket.may_send() {
-                    tracing::debug!("listener {}: established -> accept queue", entry.listen_ep.port);
+                    tracing::debug!(
+                        "listener {}: established -> accept queue",
+                        entry.listen_ep.port
+                    );
                     entry.listen_pool.swap_remove(i);
                     entry.accept_queue.push_back(handle);
                     queued = true;
@@ -217,7 +230,8 @@ impl NetstackState {
             let mut i = 0;
             while i < entry.listen_pool.len() {
                 let handle = entry.listen_pool[i].0;
-                let listening = self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Listen;
+                let listening =
+                    self.sockets.get::<tcp::Socket>(handle).state() == tcp::State::Listen;
                 if listening {
                     entry.listen_pool[i].1 = None;
                     i += 1;
@@ -230,7 +244,10 @@ impl NetstackState {
                     }
                     Some(t) => {
                         if now - t > SYN_HANDSHAKE_TIMEOUT.into() {
-                            tracing::debug!("listener {}: reaping stuck handshake", entry.listen_ep.port);
+                            tracing::debug!(
+                                "listener {}: reaping stuck handshake",
+                                entry.listen_ep.port
+                            );
                             self.sockets.get_mut::<tcp::Socket>(handle).abort();
                             self.sockets.remove(handle);
                             entry.listen_pool.swap_remove(i);
@@ -379,8 +396,8 @@ impl YggNetstack {
                 let mut buf = vec![0u8; 65536];
                 loop {
                     match rwc2.read(&mut buf).await {
-                        Ok(data) if !data.is_empty()
-                            && pkt_tx.send(data.to_vec()).await.is_err() =>
+                        Ok(data)
+                            if !data.is_empty() && pkt_tx.send(data.to_vec()).await.is_err() =>
                         {
                             break;
                         }
@@ -452,10 +469,7 @@ impl YggNetstack {
             }
         });
 
-        *self
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(vec![reader, poller]);
+        *self.tasks.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![reader, poller]);
     }
 
     /// Shut the netstack down: every in-flight socket operation fails, dial
@@ -677,6 +691,37 @@ impl YggNetstack {
             poll_wakeup: self.poll_wakeup.clone(),
         })
     }
+
+    /// Open an ICMPv6 echo socket bound to a random identifier, suitable
+    /// for pinging remote Yggdrasil addresses. Replies are matched to the
+    /// bound identifier by smoltcp's ICMP socket layer.
+    pub fn open_icmp(&self) -> io::Result<PingSocket> {
+        let ident: u16 = rand::random();
+        let handle = {
+            let mut s = lock_state(&self.state);
+            let rx_meta = vec![icmp::PacketMetadata::EMPTY; 8];
+            let tx_meta = vec![icmp::PacketMetadata::EMPTY; 8];
+            let rx_data = vec![0u8; 2048];
+            let tx_data = vec![0u8; 2048];
+            let h = s.sockets.add(icmp::Socket::new(
+                icmp::PacketBuffer::new(rx_meta, rx_data),
+                icmp::PacketBuffer::new(tx_meta, tx_data),
+            ));
+            s.sockets
+                .get_mut::<icmp::Socket>(h)
+                .bind(icmp::Endpoint::Ident(ident))
+                .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("{:?}", e)))?;
+            h
+        };
+        self.poll_wakeup.notify_one();
+        Ok(PingSocket {
+            handle,
+            ident,
+            our_addr: self.our_addr,
+            state: self.state.clone(),
+            poll_wakeup: self.poll_wakeup.clone(),
+        })
+    }
 }
 
 // ── TcpStream ─────────────────────────────────────────────────────────────────
@@ -695,12 +740,12 @@ impl TcpStream {
             let sock = s.sockets.get::<tcp::Socket>(self.handle);
             match sock.state() {
                 tcp::State::Established => Poll::Ready(Ok(())),
-                tcp::State::Closed
-                | tcp::State::TimeWait
-                | tcp::State::CloseWait => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "connection refused",
-                ))),
+                tcp::State::Closed | tcp::State::TimeWait | tcp::State::CloseWait => {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "connection refused",
+                    )))
+                }
                 _ => {
                     s.wakers.push(cx.waker().clone());
                     Poll::Pending
@@ -932,11 +977,124 @@ impl Drop for UdpSocket {
     }
 }
 
+// ── PingSocket ────────────────────────────────────────────────────────────────
+
+/// ICMPv6 echo socket over the netstack. Sends echo requests to arbitrary
+/// Yggdrasil addresses and receives the matching echo replies (matched by
+/// the bound identifier), mirroring [UdpSocket]'s lock/wake pattern.
+pub struct PingSocket {
+    handle: SocketHandle,
+    /// The identifier bound into every request/reply of this socket.
+    pub ident: u16,
+    our_addr: Ipv6Addr,
+    state: Arc<Mutex<NetstackState>>,
+    poll_wakeup: Arc<Notify>,
+}
+
+impl PingSocket {
+    /// Queue one echo request with the given sequence number and payload.
+    /// The packet is built with smoltcp's wire types; checksums are computed
+    /// on dispatch by the interface.
+    pub async fn send_echo(&self, dst: Ipv6Addr, seq: u16, payload: &[u8]) -> io::Result<()> {
+        let repr = smoltcp::wire::Icmpv6Repr::EchoRequest {
+            ident: self.ident,
+            seq_no: seq,
+            data: payload,
+        };
+        let mut packet = vec![0u8; repr.buffer_len()];
+        repr.emit(
+            &IpAddress::Ipv6(Ipv6Address::from_bytes(&self.our_addr.octets())),
+            &IpAddress::Ipv6(Ipv6Address::from_bytes(&dst.octets())),
+            &mut smoltcp::wire::Icmpv6Packet::new_unchecked(&mut packet),
+            &ChecksumCapabilities::ignored(),
+        );
+
+        std::future::poll_fn(|cx| {
+            let mut s = lock_state(&self.state);
+            if s.closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "netstack closed",
+                )));
+            }
+            let sock = s.sockets.get_mut::<icmp::Socket>(self.handle);
+            if sock.can_send() {
+                return Poll::Ready(
+                    match sock.send_slice(
+                        &packet,
+                        IpAddress::Ipv6(Ipv6Address::from_bytes(&dst.octets())),
+                    ) {
+                        Ok(()) => {
+                            drop(s);
+                            self.poll_wakeup.notify_one();
+                            Ok(())
+                        }
+                        Err(e) => Err(io::Error::other(format!("{:?}", e))),
+                    },
+                );
+            }
+            s.wakers.push(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Wait for the next queued echo reply. Returns the reply's sequence
+    /// number and source address; replies for other sequence numbers can
+    /// arrive late and must be drained by the caller.
+    pub async fn recv_reply(&self, buf: &mut [u8]) -> io::Result<(u16, Ipv6Addr)> {
+        let (n, src) = std::future::poll_fn(|cx| {
+            let mut s = lock_state(&self.state);
+            if s.closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "netstack closed",
+                )));
+            }
+            let sock = s.sockets.get_mut::<icmp::Socket>(self.handle);
+            if sock.can_recv() {
+                return Poll::Ready(match sock.recv_slice(buf) {
+                    Ok((n, src)) => Ok((n, src)),
+                    Err(e) => Err(io::Error::other(format!("{:?}", e))),
+                });
+            }
+            s.wakers.push(cx.waker().clone());
+            Poll::Pending
+        })
+        .await?;
+
+        let src_ip = match src {
+            IpAddress::Ipv6(a) => {
+                let octets: [u8; 16] = a.as_bytes().try_into().unwrap();
+                Ipv6Addr::from(octets)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-IPv6 echo reply",
+                ))
+            }
+        };
+        let packet = smoltcp::wire::Icmpv6Packet::new_unchecked(&buf[..n]);
+        let seq = packet.echo_seq_no();
+        Ok((seq, src_ip))
+    }
+}
+
+impl Drop for PingSocket {
+    fn drop(&mut self) {
+        lock_state(&self.state).sockets.remove(self.handle);
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Wait for a background task to finish with a grace period, then abort it.
 async fn join_with_grace(handle: &mut tokio::task::JoinHandle<()>) {
-    if tokio::time::timeout(Duration::from_secs(2), &mut *handle).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(2), &mut *handle)
+        .await
+        .is_err()
+    {
         handle.abort();
         let _ = handle.await;
     }
