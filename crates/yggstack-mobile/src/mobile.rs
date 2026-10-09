@@ -764,18 +764,26 @@ impl YggstackMobile {
                     .and_then(|u| u.rsplit(':').next())
                     .and_then(|p| p.parse::<u16>().ok())
                     .unwrap_or(0);
+                // The Yggdrasil address derived from the peer's public key;
+                // empty for configured-but-never-connected peers (zero key).
+                let addr = if p.key.iter().any(|b| *b != 0) {
+                    config::addr_for_key(&p.key).to_string()
+                } else {
+                    String::new()
+                };
                 format!(
-                    r#"{{"URI":{uri},"Up":{up},"Inbound":{inbound},"Port":{port},"Priority":{prio},"Cost":{cost},"RXBytes":{rx},"TXBytes":{tx},"Uptime":{uptime:.0},"Latency":{latency:.0}}}"#,
+                    r#"{{"URI":{uri},"Up":{up},"Inbound":{inbound},"Address":{addr},"Port":{port},"Priority":{prio},"Cost":{cost},"RXBytes":{rx},"TXBytes":{tx},"Uptime":{uptime:.0},"Latency":{latency:.0}}}"#,
                     uri = uri_json,
                     up = p.up,
                     inbound = p.inbound,
+                    addr = serde_json::to_string(&addr).unwrap_or_else(|_| "\"\"".to_string()),
                     port = port,
                     prio = p.priority,
                     cost = p.cost,
                     rx = p.rx_bytes,
                     tx = p.tx_bytes,
                     uptime = p.uptime_secs * 1_000_000_000.0,
-                    latency = p.latency_ms * 1_000_000.0,
+                    latency = p.latency_ms * 1_000_000_000.0,
                 )
             })
             .collect();
