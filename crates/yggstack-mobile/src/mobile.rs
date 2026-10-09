@@ -783,7 +783,7 @@ impl YggstackMobile {
                     rx = p.rx_bytes,
                     tx = p.tx_bytes,
                     uptime = p.uptime_secs * 1_000_000_000.0,
-                    latency = p.latency_ms * 1_000_000_000.0,
+                    latency = p.latency_ms * 1_000_000.0,
                 )
             })
             .collect();
