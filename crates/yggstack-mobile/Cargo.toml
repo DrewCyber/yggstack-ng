@@ -21,7 +21,7 @@ ckr = []
 
 [dependencies]
 yggstack   = { path = "../yggstack", features = ["ckr"] }
-yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "85f71fe", default-features = false, features = ["ckr", "ws", "quic"] }
+yggdrasil  = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "c9a54f1", default-features = false, features = ["ckr", "ws", "quic"] }
 
 # QUIC RTT probe (check_quic_peer) — versions/features mirror the yggdrasil pins
 quinn  = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
