@@ -130,6 +130,58 @@ pub trait PingCallback: Send + Sync {
     fn on_result(&self, result: String);
 }
 
+// ── PeerStatusCallback (UniFFI callback interface) ───────────────────────────
+
+pub trait PeerStatusCallback: Send + Sync {
+    fn on_peers_changed(&self, peers_json: String);
+}
+
+/// Debounce window coalescing bursts of peer events (e.g. a network flap
+/// dropping several peers at once) into a single snapshot delivery.
+const PEER_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Render the core's peer list in the shared JSON schema. Used by both
+/// get_peers_json() and the peer-events forwarder, so the snapshot a
+/// callback delivers is byte-identical to what polling would return.
+async fn peers_snapshot_json(core: &Arc<Core>) -> String {
+    let peers = core.get_peers().await;
+    let items: Vec<String> = peers
+        .iter()
+        .map(|p| {
+            let uri_json = serde_json::to_string(&p.uri).unwrap_or_else(|_| "\"\"".to_string());
+            let port = p
+                .uri
+                .split('?')
+                .next()
+                .and_then(|u| u.rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            // The Yggdrasil address derived from the peer's public key;
+            // empty for configured-but-never-connected peers (zero key).
+            let addr = if p.key.iter().any(|b| *b != 0) {
+                config::addr_for_key(&p.key).to_string()
+            } else {
+                String::new()
+            };
+            format!(
+                r#"{{"URI":{uri},"Up":{up},"Inbound":{inbound},"Address":{addr},"Port":{port},"Priority":{prio},"Cost":{cost},"RXBytes":{rx},"TXBytes":{tx},"Uptime":{uptime:.0},"Latency":{latency:.0}}}"#,
+                uri = uri_json,
+                up = p.up,
+                inbound = p.inbound,
+                addr = serde_json::to_string(&addr).unwrap_or_else(|_| "\"\"".to_string()),
+                port = port,
+                prio = p.priority,
+                cost = p.cost,
+                rx = p.rx_bytes,
+                tx = p.tx_bytes,
+                uptime = p.uptime_secs * 1_000_000_000.0,
+                latency = p.latency_ms * 1_000_000.0,
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 /// Render one [PingEvent] as the JSON protocol shared with the Go engine.
 fn ping_event_json(ev: PingEvent) -> String {
     match ev {
@@ -207,6 +259,8 @@ struct NodeState {
     stats: Arc<ListenerStatsRegistry>,
     socks_handle: Option<tokio::task::JoinHandle<()>>,
     http_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Peer-events forwarder task for the registered PeerStatusCallback.
+    peer_events_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// A listener started for one mapping; firing `stop_tx` stops it and
@@ -256,6 +310,9 @@ pub struct YggstackMobile {
     listeners: Mutex<std::collections::HashMap<String, RunningListener>>,
     /// The running ping session, if any.
     ping: Mutex<Option<PingSession>>,
+    /// App callback receiving peer snapshots; consumed by start() when the
+    /// peer-events forwarder is spawned.
+    peer_status_callback: Mutex<Option<std::sync::Arc<dyn PeerStatusCallback>>>,
 }
 
 impl Default for YggstackMobile {
@@ -284,11 +341,16 @@ impl YggstackMobile {
             remote_udp: Mutex::new(Vec::new()),
             listeners: Mutex::new(std::collections::HashMap::new()),
             ping: Mutex::new(None),
+            peer_status_callback: Mutex::new(None),
         }
     }
 
     pub fn set_log_callback(&self, callback: Box<dyn LogCallback>) {
         *LOG_SINK.lock().unwrap() = Some(callback);
+    }
+
+    pub fn set_peer_status_callback(&self, callback: Box<dyn PeerStatusCallback>) {
+        *self.peer_status_callback.lock().unwrap() = Some(std::sync::Arc::from(callback));
     }
 
     /// Set the app-facing log verbosity ("error".."trace"). Controls which
@@ -421,6 +483,47 @@ impl YggstackMobile {
             let stats = ListenerStatsRegistry::new();
             let (stop_tx, _) = tokio::sync::broadcast::channel(1);
 
+            // Peer-events forwarder: on every connect/disconnect (debounced)
+            // push a fresh peer snapshot through the app callback. Events are
+            // only triggers — the snapshot is always re-queried from the
+            // core, so a missed or lagged event can never produce a stale
+            // count. The baseline delivery right after subscribing gives the
+            // consumer its initial state without polling.
+            let mut peer_events_handle = None;
+            {
+                let peer_cb = self.peer_status_callback.lock().unwrap().clone();
+                if let Some(cb) = peer_cb {
+                    let core2 = core.clone();
+                    let mut stop_rx = stop_tx.subscribe();
+                    peer_events_handle = Some(tokio::spawn(async move {
+                        let mut events = core2.subscribe_peer_events();
+                        cb.on_peers_changed(peers_snapshot_json(&core2).await);
+                        loop {
+                            let ev = tokio::select! {
+                                _ = stop_rx.recv() => break,
+                                ev = events.recv() => ev,
+                            };
+                            match ev {
+                                Ok(_) => {}
+                                // Lagged: events were dropped; the snapshot
+                                // below is the truth, so just continue.
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(_) => break,
+                            }
+                            let stopped = tokio::select! {
+                                _ = stop_rx.recv() => true,
+                                _ = tokio::time::sleep(PEER_DEBOUNCE) => false,
+                            };
+                            if stopped {
+                                break;
+                            }
+                            while events.try_recv().is_ok() {}
+                            cb.on_peers_changed(peers_snapshot_json(&core2).await);
+                        }
+                    }));
+                }
+            }
+
             let mut socks_handle = None;
             if let Some(addr) = socks_addr {
                 let srv = Arc::new(Socks5Server::new(netstack.clone(), resolver.clone()));
@@ -477,6 +580,7 @@ impl YggstackMobile {
                 stats,
                 socks_handle,
                 http_handle,
+                peer_events_handle,
             }
         });
 
@@ -489,7 +593,14 @@ impl YggstackMobile {
         // before the node (and with it the netstack) is torn down.
         self.stop_ping();
         let node = { self.state.lock().unwrap().take() };
-        if let Some(node) = node {
+        if let Some(mut node) = node {
+            // Stop the peer-events forwarder first: its task snapshots the
+            // core that is torn down below, and its callback must not fire
+            // against a half-stopped node.
+            if let Some(handle) = node.peer_events_handle.as_mut() {
+                let _ = node.stop_tx.send(());
+                self.rt.block_on(join_listener(handle));
+            }
             self.rt.block_on(node.core.close_multicast());
             // Close links + the ironwood core as well. Without this the old
             // instance keeps its peer connections alive under the same node
@@ -754,40 +865,7 @@ impl YggstackMobile {
         let Some(core) = core else {
             return "[]".to_string();
         };
-        let peers = self.rt.block_on(core.get_peers());
-        let items: Vec<String> = peers
-            .iter()
-            .map(|p| {
-                let uri_json =
-                    serde_json::to_string(&p.uri).unwrap_or_else(|_| "\"\"".to_string());
-                let port = p.uri.split('?').next()
-                    .and_then(|u| u.rsplit(':').next())
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(0);
-                // The Yggdrasil address derived from the peer's public key;
-                // empty for configured-but-never-connected peers (zero key).
-                let addr = if p.key.iter().any(|b| *b != 0) {
-                    config::addr_for_key(&p.key).to_string()
-                } else {
-                    String::new()
-                };
-                format!(
-                    r#"{{"URI":{uri},"Up":{up},"Inbound":{inbound},"Address":{addr},"Port":{port},"Priority":{prio},"Cost":{cost},"RXBytes":{rx},"TXBytes":{tx},"Uptime":{uptime:.0},"Latency":{latency:.0}}}"#,
-                    uri = uri_json,
-                    up = p.up,
-                    inbound = p.inbound,
-                    addr = serde_json::to_string(&addr).unwrap_or_else(|_| "\"\"".to_string()),
-                    port = port,
-                    prio = p.priority,
-                    cost = p.cost,
-                    rx = p.rx_bytes,
-                    tx = p.tx_bytes,
-                    uptime = p.uptime_secs * 1_000_000_000.0,
-                    latency = p.latency_ms * 1_000_000.0,
-                )
-            })
-            .collect();
-        format!("[{}]", items.join(","))
+        self.rt.block_on(peers_snapshot_json(&core))
     }
 
     /// Start an ICMPv6 ping session to a Yggdrasil address (see the UDL for

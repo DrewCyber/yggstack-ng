@@ -29,6 +29,13 @@ callback interface PingCallback {
     void on_result(string result);
 };
 
+callback interface PeerStatusCallback {
+    /// Full peer snapshot, same JSON schema as get_peers_json(), delivered
+    /// on every change of the connected-peer set plus once right after
+    /// start() as a baseline.
+    void on_peers_changed(string peers_json);
+};
+
 // ── Main interface ────────────────────────────────────────────────────────────
 
 interface YggstackMobile {
@@ -36,6 +43,12 @@ interface YggstackMobile {
 
     /// Set a log callback for Android logcat integration.
     void set_log_callback(LogCallback callback);
+
+    /// Set a peer status callback receiving the full peer snapshot (same
+    /// JSON as get_peers_json()) on every peer connect/disconnect change,
+    /// plus a baseline right after start(). Takes effect at the next
+    /// start().
+    void set_peer_status_callback(PeerStatusCallback callback);
 
     /// Set log level: "error", "warn", "info", "debug", "trace".
     void set_log_level(string level);
