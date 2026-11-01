@@ -169,4 +169,20 @@ interface YggstackMobile {
     /// Stop the running ping session (if any). Its callback receives a
     /// final {"Type":"done","Reason":"stopped"} event.
     void stop_ping();
+
+    /// One-shot liveness probe of a remote Yggdrasil TCP service
+    /// ("[200:...]:port"), dialed through the node's own netstack — no
+    /// proxy involved. Returns "connected" (handshake completed: a real
+    /// service answered), "refused" (RST: nothing listens on that port),
+    /// "timeout" (no answer within timeout_ms), or "error" (node not
+    /// running / malformed address).
+    string check_tcp_port(string addr_port, i64 timeout_ms);
+
+    /// One-shot UDP probe: sends datagrams to a remote Yggdrasil UDP
+    /// port and listens for any reply (a mid-window re-probe covers the
+    /// lookup-consumed first datagram; port 53 is probed with a real
+    /// minimal DNS query). Returns "replied" (a service answered),
+    /// "silent" (no reply — inconclusive in UDP, not proof of death),
+    /// or "error" (node not running / malformed address).
+    string check_udp_port(string addr_port, i64 timeout_ms);
 };

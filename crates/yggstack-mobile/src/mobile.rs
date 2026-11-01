@@ -232,6 +232,46 @@ fn watch_stop(mut rx: tokio::sync::watch::Receiver<bool>) -> impl std::future::F
     }
 }
 
+/// Parse "[200:...]:port" and verify it is a Yggdrasil address (200::/7).
+fn parse_ygg_addr_port(s: &str) -> Option<std::net::SocketAddr> {
+    let addr: std::net::SocketAddr = s.trim().parse().ok()?;
+    match addr {
+        std::net::SocketAddr::V6(a) if ping::is_ygg_address(&a.ip()) => Some(addr),
+        _ => None,
+    }
+}
+
+/// Pseudo-random ephemeral port for probe sockets (same range open_udp
+/// uses); collisions retry in the caller.
+fn probe_ephemeral_port() -> u16 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos as u16) % 16384 + 49152
+}
+
+/// The probe datagram for a UDP port. Port 53 is DNS by assignment: a
+/// minimal well-formed root NS query — any DNS reply (NOERROR, REFUSED,
+/// FORMERR…) proves a live service, where a zero-filled datagram is
+/// silently dropped by most servers. Other ports get the generic zero
+/// probe, which reply-happy protocols still answer.
+fn udp_probe_payload(port: u16) -> Vec<u8> {
+    if port == 53 {
+        vec![
+            0x12, 0x34, // ID
+            0x01, 0x00, // flags: RD
+            0x00, 0x01, // QDCOUNT: 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // counts: 0
+            0x00,       // QNAME: root
+            0x00, 0x02, // QTYPE: NS
+            0x00, 0x01, // QCLASS: IN
+        ]
+    } else {
+        vec![0u8; 16]
+    }
+}
+
 // ── Namespace functions ───────────────────────────────────────────────────────
 
 pub fn generate_config() -> String {
@@ -419,7 +459,7 @@ impl YggstackMobile {
 
     pub fn start(&self) -> Result<(), YggstackError> {
         {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_some() {
                 return Err(YggstackError::AlreadyRunning("already running".to_string()));
             }
@@ -437,10 +477,10 @@ impl YggstackMobile {
         let socks_addr = self.socks_addr.lock().unwrap().clone();
         let http_addr = self.http_addr.lock().unwrap().clone();
         let nameserver = self.nameserver.lock().unwrap().clone();
-        let local_tcp = self.local_tcp.lock().unwrap().clone();
-        let local_udp = self.local_udp.lock().unwrap().clone();
-        let remote_tcp = self.remote_tcp.lock().unwrap().clone();
-        let remote_udp = self.remote_udp.lock().unwrap().clone();
+        let local_tcp = self.local_tcp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let local_udp = self.local_udp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let remote_tcp = self.remote_tcp.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let remote_udp = self.remote_udp.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let want_multicast = !cfg.multicast_interfaces.is_empty();
         let node = self.rt.block_on(async {
@@ -550,7 +590,7 @@ impl YggstackMobile {
                 }));
             }
 
-            let mut listeners = self.listeners.lock().unwrap();
+            let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             for m in local_tcp {
                 self.spawn_listener(&mut listeners, &netstack, &stats, m, |ns, m, st, tx| {
                     spawn_local_tcp(ns, m, tx, st)
@@ -584,7 +624,7 @@ impl YggstackMobile {
             }
         });
 
-        *self.state.lock().unwrap() = Some(node);
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
         Ok(())
     }
 
@@ -592,7 +632,7 @@ impl YggstackMobile {
         // End the ping session first so its task and callback events stop
         // before the node (and with it the netstack) is torn down.
         self.stop_ping();
-        let node = { self.state.lock().unwrap().take() };
+        let node = { self.state.lock().unwrap_or_else(|e| e.into_inner()).take() };
         if let Some(mut node) = node {
             // Stop the peer-events forwarder first: its task snapshots the
             // core that is torn down below, and its callback must not fire
@@ -627,7 +667,7 @@ impl YggstackMobile {
         // sockets are closed before stop() returns — an immediate restart
         // can then rebind the same ports without racing the old tasks.
         let listeners: Vec<RunningListener> = {
-            let mut guard = self.listeners.lock().unwrap();
+            let mut guard = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             guard.drain().map(|(_, v)| v).collect()
         };
         let mut handles = Vec::new();
@@ -670,6 +710,15 @@ impl YggstackMobile {
             tokio::sync::broadcast::Sender<()>,
         ) -> (String, tokio::task::JoinHandle<()>),
     ) {
+        // The spawners call tokio::spawn, which panics outside a runtime
+        // context. At start() we already run inside rt.block_on; the live
+        // add_* entry points arrive on foreign (UniFFI) threads and must
+        // enter the runtime explicitly.
+        let _entered = if tokio::runtime::Handle::try_current().is_ok() {
+            None
+        } else {
+            Some(self.rt.enter())
+        };
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         let (key, handle) = spawn_fn(netstack.clone(), mapping, stats.clone(), tx.clone());
         // Keep `rx` alive so a stop fired before the task first polls its own
@@ -686,9 +735,9 @@ impl YggstackMobile {
 
     pub fn add_local_tcp(&self, spec: String) -> Result<(), YggstackError> {
         let m = TcpMapping::parse_local(&spec).map_err(YggstackError::Config)?;
-        self.local_tcp.lock().unwrap().push(m.clone());
-        if let Some(node) = self.state.lock().unwrap().as_ref() {
-            let mut ls = self.listeners.lock().unwrap();
+        self.local_tcp.lock().unwrap_or_else(|e| e.into_inner()).push(m.clone());
+        if let Some(node) = self.state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let mut ls = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
                 spawn_local_tcp(ns, m, tx, st)
             });
@@ -698,9 +747,9 @@ impl YggstackMobile {
 
     pub fn add_local_udp(&self, spec: String) -> Result<(), YggstackError> {
         let m = UdpMapping::parse_local(&spec).map_err(YggstackError::Config)?;
-        self.local_udp.lock().unwrap().push(m.clone());
-        if let Some(node) = self.state.lock().unwrap().as_ref() {
-            let mut ls = self.listeners.lock().unwrap();
+        self.local_udp.lock().unwrap_or_else(|e| e.into_inner()).push(m.clone());
+        if let Some(node) = self.state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let mut ls = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
                 spawn_local_udp(ns, m, tx, st)
             });
@@ -710,9 +759,9 @@ impl YggstackMobile {
 
     pub fn add_remote_tcp(&self, spec: String) -> Result<(), YggstackError> {
         let m = TcpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
-        self.remote_tcp.lock().unwrap().push(m.clone());
-        if let Some(node) = self.state.lock().unwrap().as_ref() {
-            let mut ls = self.listeners.lock().unwrap();
+        self.remote_tcp.lock().unwrap_or_else(|e| e.into_inner()).push(m.clone());
+        if let Some(node) = self.state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let mut ls = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
                 spawn_remote_tcp(ns, m, tx, st)
             });
@@ -722,9 +771,9 @@ impl YggstackMobile {
 
     pub fn add_remote_udp(&self, spec: String) -> Result<(), YggstackError> {
         let m = UdpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
-        self.remote_udp.lock().unwrap().push(m.clone());
-        if let Some(node) = self.state.lock().unwrap().as_ref() {
-            let mut ls = self.listeners.lock().unwrap();
+        self.remote_udp.lock().unwrap_or_else(|e| e.into_inner()).push(m.clone());
+        if let Some(node) = self.state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let mut ls = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
                 spawn_remote_udp(ns, m, tx, st)
             });
@@ -779,19 +828,19 @@ impl YggstackMobile {
     }
 
     fn stop_listener(&self, key: &str) {
-        if let Some(mut l) = self.listeners.lock().unwrap().remove(key) {
+        if let Some(mut l) = self.listeners.lock().unwrap_or_else(|e| e.into_inner()).remove(key) {
             let _ = l.stop_tx.send(());
             self.rt.block_on(join_listener(&mut l.handle));
         }
     }
 
     pub fn clear_mappings(&self) {
-        self.local_tcp.lock().unwrap().clear();
-        self.local_udp.lock().unwrap().clear();
-        self.remote_tcp.lock().unwrap().clear();
-        self.remote_udp.lock().unwrap().clear();
+        self.local_tcp.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.local_udp.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.remote_tcp.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.remote_udp.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let listeners: Vec<RunningListener> = {
-            let mut guard = self.listeners.lock().unwrap();
+            let mut guard = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             guard.drain().map(|(_, v)| v).collect()
         };
         for l in listeners {
@@ -800,12 +849,12 @@ impl YggstackMobile {
     }
 
     pub fn is_running(&self) -> bool {
-        self.state.lock().unwrap().is_some()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     pub fn add_live_peer(&self, uri: String) -> Result<(), YggstackError> {
         let core = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .map(|n| n.core.clone())
@@ -818,7 +867,7 @@ impl YggstackMobile {
 
     pub fn remove_live_peer(&self, uri: String) -> Result<(), YggstackError> {
         let core = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .map(|n| n.core.clone())
@@ -831,7 +880,7 @@ impl YggstackMobile {
 
     pub fn retry_peers_now(&self) {
         let core = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|n| n.core.clone())
         };
         if let Some(core) = core {
@@ -845,7 +894,7 @@ impl YggstackMobile {
     ///     "RXBytes","TXBytes"}]
     /// Returns "[]" when the node is not running.
     pub fn get_listeners_json(&self) -> String {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(node) => node.stats.to_json(),
             None => "[]".to_string(),
@@ -859,7 +908,7 @@ impl YggstackMobile {
     /// Returns "[]" when the node is not running.
     pub fn get_peers_json(&self) -> String {
         let core = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|n| n.core.clone())
         };
         let Some(core) = core else {
@@ -893,7 +942,7 @@ impl YggstackMobile {
         let interval = Duration::from_millis(interval_ms.clamp(0, 60_000) as u64);
 
         let netstack = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .map(|n| n.netstack.clone())
@@ -933,6 +982,133 @@ impl YggstackMobile {
             }
         });
     }
+
+    /// One-shot liveness probe of a remote Yggdrasil TCP service through
+    /// the node's own netstack — no proxy or mapping involved. Returns
+    /// "connected" (handshake completed: a listener answered), "refused"
+    /// (RST: nothing listens on that port), "timeout" (no answer within
+    /// timeout_ms) or "error" (node not running / malformed address).
+    /// The dial is attempted twice with a short gap: on a cold start the
+    /// overlay's key lookup for the destination is still in flight while
+    /// the first dial runs — the retry dials through the now-cached key
+    /// instead of reporting a spurious red.
+    pub fn check_tcp_port(&self, addr_port: String, timeout_ms: i64) -> String {
+        let Some(addr) = parse_ygg_addr_port(&addr_port) else {
+            return "error".to_string();
+        };
+        let netstack = match self.running_netstack() {
+            Some(ns) => ns,
+            None => return "error".to_string(),
+        };
+        let timeout = Duration::from_millis(timeout_ms.clamp(100, 15_000) as u64);
+        // Layered windows: the first attempt only triggers the overlay's
+        // key lookup (a warm destination answers well within a second);
+        // the retry dials with the full window through the cached key.
+        let first_window = timeout.min(Duration::from_secs(1));
+        // The timeout future must be constructed INSIDE block_on: its Sleep
+        // timer resolves the current runtime handle eagerly at creation,
+        // which panics outside any runtime context.
+        self.rt.block_on(async {
+            let mut last = "timeout";
+            for attempt in 0..2 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                let window = if attempt == 0 { first_window } else { timeout };
+                match tokio::time::timeout(window, netstack.dial_tcp(addr)).await {
+                    Ok(Ok(_)) => return "connected".to_string(),
+                    // The stack surfaces a remote RST as ConnectionRefused:
+                    // a real answer proving nothing listens on that port.
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        last = "refused"
+                    }
+                    _ => last = "timeout",
+                }
+            }
+            last.to_string()
+        })
+    }
+
+    /// One-shot UDP probe: sends datagrams to a remote Yggdrasil UDP port
+    /// and listens for any reply. UDP has no universal handshake, so silence
+    /// is inconclusive rather than proof of death: returns "replied" (a
+    /// service answered), "silent" (no reply within timeout_ms) or "error"
+    /// (node not running / send failed / malformed address). The probe is
+    /// re-sent across the window (cold-start key lookups consume the
+    /// earliest datagrams); port 53 is probed with a real minimal DNS
+    /// query, which generic zero-filled datagrams would be silently
+    /// dropped for by most servers.
+    pub fn check_udp_port(&self, addr_port: String, timeout_ms: i64) -> String {
+        let Some(addr) = parse_ygg_addr_port(&addr_port) else {
+            return "error".to_string();
+        };
+        let netstack = match self.running_netstack() {
+            Some(ns) => ns,
+            None => return "error".to_string(),
+        };
+        let timeout = Duration::from_millis(timeout_ms.clamp(100, 15_000) as u64);
+        self.rt.block_on(async move {
+            // Not open_udp(): ANY-bound sockets do not receive ingress in
+            // this netstack — bind to the node's own address on a random
+            // ephemeral port (retry on the rare collision).
+            let sock = (0..3)
+                .find_map(|_| {
+                    let port = probe_ephemeral_port();
+                    netstack.bind_udp(port).ok()
+                })
+                .or_else(|| netstack.open_udp().ok())?;
+            let probe = udp_probe_payload(addr.port());
+            // Full-size receive buffer: smoltcp's UDP recv errors with
+            // Truncated when the datagram does not fit — any smaller buffer
+            // would turn every real reply into an error.
+            let mut buf = vec![0u8; 65_535];
+            // Re-send the probe across the window (0 / 400ms / 1s / 1.8s):
+            // on a cold start the earliest datagrams are consumed by the
+            // overlay's key lookup — TCP rides this out with SYN
+            // retransmission, UDP has none. Any reply counts.
+            let send_at = [
+                Duration::from_millis(0),
+                Duration::from_millis(400),
+                Duration::from_millis(1000),
+                Duration::from_millis(1800),
+            ];
+            let start = tokio::time::Instant::now();
+            let mut sent = 0;
+            loop {
+                if sent < send_at.len() && start.elapsed() >= send_at[sent] {
+                    sock.send_to(&probe, addr).await.ok()?;
+                    sent += 1;
+                }
+                let next_event = if sent < send_at.len() {
+                    send_at[sent]
+                } else {
+                    timeout
+                }
+                .saturating_sub(start.elapsed());
+                tokio::select! {
+                    r = sock.recv_from(&mut buf) => {
+                        if r.is_ok() {
+                            return Some("replied");
+                        }
+                        return None;
+                    }
+                    _ = tokio::time::sleep(next_event) => {
+                        if start.elapsed() >= timeout {
+                            return Some("silent");
+                        }
+                    }
+                }
+            }
+        })
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "error".to_string())
+    }
+
+    /// The live netstack, or None when the node is not running.
+    fn running_netstack(&self) -> Option<Arc<YggNetstack>> {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|n| n.netstack.clone())
+    }
 }
 
 impl Drop for YggstackMobile {
@@ -950,5 +1126,149 @@ impl Drop for YggstackMobile {
             .expect("failed to create placeholder runtime");
         let rt = std::mem::replace(&mut self.rt, placeholder);
         rt.shutdown_timeout(SHUTDOWN_GRACE);
+    }
+}
+
+#[cfg(test)]
+mod port_check_tests {
+    use super::*;
+
+    // The port checks must verify a real service on the remote side, dialed
+    // through the node's own netstack. An offline node plus its own remote
+    // (exposed) mappings make a self-contained remote side: a dial to the
+    // node's Yggdrasil address lands on the exposed port, forwarded to the
+    // loopback service.
+
+    fn started_node() -> (YggstackMobile, String) {
+        let y = YggstackMobile::new();
+        y.generate_and_load_config().expect("config");
+        y.start().expect("start");
+        let addr = y.get_address().expect("address");
+        (y, addr)
+    }
+
+    #[test]
+    fn udp_probe_payload_dns() {
+        let dns = udp_probe_payload(53);
+        assert_eq!(dns.len(), 17, "minimal root NS query is 17 bytes");
+        assert_eq!(&dns[..2], &[0x12, 0x34]);
+        assert_eq!(dns[2], 0x01, "RD flag set");
+        assert_eq!(udp_probe_payload(5353), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn live_mapping_toggle_outside_runtime_context() {
+        let (y, addr) = started_node();
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = ln.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in ln.incoming() {
+                drop(c);
+            }
+        });
+        // Live entry points arrive on UniFFI threads with no runtime
+        // context: both must enter the runtime internally instead of
+        // panicking ("there is no reactor running") and poisoning the
+        // state lock (regression: ng could not enable forwards on the
+        // fly, and stop() then failed with PoisonError).
+        y.add_remote_tcp(format!("{port}:127.0.0.1:{port}")).expect("live expose");
+        y.add_local_tcp(format!("127.0.0.1:{port}:[{addr}]:{port}")).expect("live forward");
+
+        // Full data path through the live-added forward
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live-added forward never connected"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The port check runs on this same foreign thread
+        assert_eq!(y.check_tcp_port(format!("[{addr}]:{port}"), 2000), "connected");
+        y.stop();
+    }
+
+    #[test]
+    fn check_tcp_port_outcomes() {
+        let (y, addr) = started_node();
+
+        // A real remote service: loopback listener exposed via the node
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = ln.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in ln.incoming() {
+                drop(c); // handshake completes; nothing to serve
+            }
+        });
+        // add_remote_* must run inside the runtime context (its listener
+        // spawns via tokio::spawn) — the same context the start() path
+        // provides in production.
+        y.rt
+            .block_on(async { y.add_remote_tcp(format!("{port}:127.0.0.1:{port}")).expect("mapping") });
+
+        let target = format!("[{addr}]:{port}");
+        let mut got = String::new();
+        for _ in 0..50 {
+            got = y.check_tcp_port(target.clone(), 1000);
+            if got == "connected" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(got, "connected", "exposed port must answer");
+
+        // Closed port on the node's own address: the stack answers RST
+        assert_eq!(y.check_tcp_port(format!("[{addr}]:1"), 1000), "refused");
+
+        y.stop();
+        assert_eq!(y.check_tcp_port(target, 500), "error");
+    }
+
+    #[test]
+    fn check_tcp_port_rejects_non_ygg_address() {
+        let (y, _) = started_node();
+        assert_eq!(y.check_tcp_port("127.0.0.1:80".into(), 500), "error");
+        assert_eq!(y.check_tcp_port("not-an-address".into(), 500), "error");
+        y.stop();
+    }
+
+    #[test]
+    fn check_udp_port_outcomes() {
+        let (y, addr) = started_node();
+
+        // A replying UDP service behind an exposed port
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { return };
+                if sock.send_to(&buf[..n], from).is_err() {
+                    return;
+                }
+            }
+        });
+        y.rt
+            .block_on(async { y.add_remote_udp(format!("{port}:127.0.0.1:{port}")).expect("mapping") });
+
+        let target = format!("[{addr}]:{port}");
+        let mut got = String::new();
+        for _ in 0..50 {
+            got = y.check_udp_port(target.clone(), 1000);
+            if got == "replied" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(got, "replied", "exposed UDP port must echo, got={got}");
+
+        // Closed UDP port: no answer — inconclusive, "silent" (never dead)
+        assert_eq!(y.check_udp_port(format!("[{addr}]:1"), 300), "silent");
+
+        y.stop();
+        assert_eq!(y.check_udp_port(target, 500), "error");
     }
 }
