@@ -989,9 +989,10 @@ impl YggstackMobile {
     /// (RST: nothing listens on that port), "timeout" (no answer within
     /// timeout_ms) or "error" (node not running / malformed address).
     /// The dial is attempted twice with a short gap: on a cold start the
-    /// overlay's key lookup for the destination is still in flight while
-    /// the first dial runs — the retry dials through the now-cached key
-    /// instead of reporting a spurious red.
+    /// overlay's first-contact path lookup (the signed tree-path
+    /// discovery) and session handshake are still in flight while
+    /// the first dial runs — the retry dials through the now-cached
+    /// path and session instead of reporting a spurious red.
     pub fn check_tcp_port(&self, addr_port: String, timeout_ms: i64) -> String {
         let Some(addr) = parse_ygg_addr_port(&addr_port) else {
             return "error".to_string();
@@ -1002,8 +1003,9 @@ impl YggstackMobile {
         };
         let timeout = Duration::from_millis(timeout_ms.clamp(100, 15_000) as u64);
         // Layered windows: the first attempt only triggers the overlay's
-        // key lookup (a warm destination answers well within a second);
-        // the retry dials with the full window through the cached key.
+        // first-contact path lookup and session handshake (a warm
+        // destination answers well within a second);
+        // the retry dials with the full window through the cached path.
         let first_window = timeout.min(Duration::from_secs(1));
         // The timeout future must be constructed INSIDE block_on: its Sleep
         // timer resolves the current runtime handle eagerly at creation,
@@ -1034,8 +1036,9 @@ impl YggstackMobile {
     /// is inconclusive rather than proof of death: returns "replied" (a
     /// service answered), "silent" (no reply within timeout_ms) or "error"
     /// (node not running / send failed / malformed address). The probe is
-    /// re-sent across the window (cold-start key lookups consume the
-    /// earliest datagrams); port 53 is probed with a real minimal DNS
+    /// re-sent across the window (the earliest datagrams are held back
+    /// until the overlay's first-contact path lookup and session
+    /// handshake complete); port 53 is probed with a real minimal DNS
     /// query, which generic zero-filled datagrams would be silently
     /// dropped for by most servers.
     pub fn check_udp_port(&self, addr_port: String, timeout_ms: i64) -> String {
@@ -1063,8 +1066,9 @@ impl YggstackMobile {
             // would turn every real reply into an error.
             let mut buf = vec![0u8; 65_535];
             // Re-send the probe across the window (0 / 400ms / 1s / 1.8s):
-            // on a cold start the earliest datagrams are consumed by the
-            // overlay's key lookup — TCP rides this out with SYN
+            // on a cold start the earliest datagrams are held back by the
+            // overlay's first-contact path lookup and session handshake —
+            // TCP rides this out with SYN
             // retransmission, UDP has none. Any reply counts.
             let send_at = [
                 Duration::from_millis(0),

@@ -77,7 +77,8 @@ fn self_ping_replies_through_the_stack() {
     await_done(&collector, 15);
     assert_eq!(collector.done_reason().as_deref(), Some("completed"));
     // The very first probe to any destination can be lost to the overlay's
-    // key lookup (by design: it is reported as a plain timeout). Every
+    // first-contact path lookup and session handshake (by design: it is
+    // reported as a plain timeout). Every
     // probe after the first must be answered in-stack.
     assert!(
         collector.probe_count(Some(true)) >= 2,

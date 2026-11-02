@@ -51,7 +51,8 @@ pub fn is_ygg_address(addr: &Ipv6Addr) -> bool {
 /// the session completes, is stopped (the `stop` future fires), or fails.
 ///
 /// The first probe to a never-contacted destination can be delayed by the
-/// overlay's key lookup; it is reported as-is (typically a timeout).
+/// overlay's first-contact path lookup and session handshake; it is
+/// reported as-is (typically a timeout).
 pub async fn run_ping<S, F>(
     ns: &YggNetstack,
     dst: Ipv6Addr,
