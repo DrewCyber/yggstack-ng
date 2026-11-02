@@ -3,6 +3,8 @@ use std::net::Ipv6Addr;
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
+use ironwood::Addr;
+use yggdrasil::address::Address;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 
@@ -239,6 +241,19 @@ fn parse_ygg_addr_port(s: &str) -> Option<std::net::SocketAddr> {
         std::net::SocketAddr::V6(a) if ping::is_ygg_address(&a.ip()) => Some(addr),
         _ => None,
     }
+}
+
+/// A bare, bracketed, or "[addr]:port" Yggdrasil address (200::/7) → its
+/// IPv6. None when it does not parse or lies outside the ygg range.
+fn parse_ygg_addr(s: &str) -> Option<Ipv6Addr> {
+    let t = s.trim();
+    let inner = if let Some(rest) = t.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        t
+    };
+    let ip: Ipv6Addr = inner.parse().ok()?;
+    ping::is_ygg_address(&ip).then_some(ip)
 }
 
 /// Pseudo-random ephemeral port for probe sockets (same range open_udp
@@ -1108,10 +1123,35 @@ impl YggstackMobile {
         .unwrap_or_else(|| "error".to_string())
     }
 
+    /// Fire-and-forget warm-up of the overlay route to a Yggdrasil
+    /// address (200::/7): triggers the same rumor path lookup a cold
+    /// packet would, with no payload — the signed response caches the
+    /// destination's path and teaches the address→key cache, so the next
+    /// real packet skips both round trips and only pays the session
+    /// handshake. No verdict is returned — the port checks that follow
+    /// are the verdict. Lookup sends are throttled to one per destination
+    /// per second; a fan-out over distinct destinations never throttles.
+    /// A port suffix on `addr` ("[200:...]:53") is accepted and ignored.
+    /// No-op when the node is not running or the address is outside
+    /// 200::/7.
+    pub fn warmup_address(&self, addr: String) {
+        let Some(ip) = parse_ygg_addr(&addr) else { return };
+        let Some(core) = self.running_core() else { return };
+        self.rt.block_on(async move {
+            core.send_lookup(Addr(Address(ip.octets()).get_key())).await;
+        });
+    }
+
     /// The live netstack, or None when the node is not running.
     fn running_netstack(&self) -> Option<Arc<YggNetstack>> {
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.as_ref().map(|n| n.netstack.clone())
+    }
+
+    /// The live core, or None when the node is not running.
+    fn running_core(&self) -> Option<Arc<Core>> {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|n| n.core.clone())
     }
 }
 

@@ -161,7 +161,8 @@ interface YggstackMobile {
     ///   {"Type":"probe","Seq":2,"Success":false,"Error":"timeout"}
     ///   {"Type":"done","Reason":"completed"|"stopped"|"error"}
     /// The first probe to an unknown destination may be delayed by the
-    /// overlay's key lookup and time out — it is reported as-is.
+    /// overlay's first-contact path lookup and session handshake and
+    /// time out — it is reported as-is.
     /// Replaces any running session. Requires a running node.
     [Throws=YggstackError]
     void start_ping(string address, i32 count, i64 timeout_ms, i64 interval_ms, PingCallback callback);
@@ -180,9 +181,21 @@ interface YggstackMobile {
 
     /// One-shot UDP probe: sends datagrams to a remote Yggdrasil UDP
     /// port and listens for any reply (a mid-window re-probe covers the
-    /// lookup-consumed first datagram; port 53 is probed with a real
+    /// first datagram held back by the first-contact path lookup and
+    /// session handshake; port 53 is probed with a real
     /// minimal DNS query). Returns "replied" (a service answered),
     /// "silent" (no reply — inconclusive in UDP, not proof of death),
     /// or "error" (node not running / malformed address).
     string check_udp_port(string addr_port, i64 timeout_ms);
+
+    /// Fire-and-forget warm-up of the overlay route to a Yggdrasil
+    /// address (200::/7): triggers the same rumor path lookup a cold
+    /// packet would, with no payload — the signed response caches the
+    /// destination's path and teaches the address→key cache, so the next
+    /// real packet skips both round trips and only pays the session
+    /// handshake. No verdict is returned — the port checks that follow
+    /// are the verdict. A port suffix on `addr` ("[200:...]:53") is
+    /// accepted and ignored. No-op when the node is not running or the
+    /// address is outside 200::/7.
+    void warmup_address(string addr);
 };
