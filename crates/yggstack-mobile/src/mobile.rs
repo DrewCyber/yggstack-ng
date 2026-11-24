@@ -774,7 +774,32 @@ impl YggstackMobile {
 
     pub fn add_remote_tcp(&self, spec: String) -> Result<(), YggstackError> {
         let m = TcpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
-        self.remote_tcp.lock().unwrap_or_else(|e| e.into_inner()).push(m.clone());
+        if m.listen.port() == 0 {
+            return Err(YggstackError::Config(
+                "remote TCP port must be 1..65535".to_string(),
+            ));
+        }
+        {
+            let mut mappings = self
+                .remote_tcp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = mappings
+                .iter()
+                .find(|x| x.listen.port() == m.listen.port())
+            {
+                if existing.target == m.target {
+                    // Same (remotePort, localAddr) is idempotent.
+                    return Ok(());
+                }
+                return Err(YggstackError::Config(format!(
+                    "remote TCP port {} is already mapped to {}",
+                    m.listen.port(),
+                    existing.target
+                )));
+            }
+            mappings.push(m.clone());
+        }
         if let Some(node) = self.state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let mut ls = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
@@ -786,7 +811,31 @@ impl YggstackMobile {
 
     pub fn add_remote_udp(&self, spec: String) -> Result<(), YggstackError> {
         let m = UdpMapping::parse_remote(&spec).map_err(YggstackError::Config)?;
-        self.remote_udp.lock().unwrap_or_else(|e| e.into_inner()).push(m.clone());
+        if m.listen.port() == 0 {
+            return Err(YggstackError::Config(
+                "remote UDP port must be 1..65535".to_string(),
+            ));
+        }
+        {
+            let mut mappings = self
+                .remote_udp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = mappings
+                .iter()
+                .find(|x| x.listen.port() == m.listen.port())
+            {
+                if existing.target == m.target {
+                    return Ok(());
+                }
+                return Err(YggstackError::Config(format!(
+                    "remote UDP port {} is already mapped to {}",
+                    m.listen.port(),
+                    existing.target
+                )));
+            }
+            mappings.push(m.clone());
+        }
         if let Some(node) = self.state.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let mut ls = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             self.spawn_listener(&mut ls, &node.netstack, &node.stats, m, |ns, m, st, tx| {
@@ -1233,6 +1282,83 @@ mod port_check_tests {
         // The port check runs on this same foreign thread
         assert_eq!(y.check_tcp_port(format!("[{addr}]:{port}"), 2000), "connected");
         y.stop();
+    }
+
+    #[test]
+    fn remote_tcp_mapping_rejects_duplicate_and_conflict() {
+        let (y, _) = started_node();
+        let port = free_port();
+        let spec = format!("{port}:127.0.0.1:{port}");
+
+        y.add_remote_tcp(spec.clone()).expect("first expose");
+        assert_eq!(
+            y.remote_tcp.lock().unwrap().len(),
+            1,
+            "first mapping must be stored once"
+        );
+
+        // Same (remotePort, localAddr) is idempotent and must not restart
+        // the listener or append a duplicate.
+        y.add_remote_tcp(spec).expect("duplicate must be idempotent");
+        assert_eq!(
+            y.remote_tcp.lock().unwrap().len(),
+            1,
+            "duplicate add must not append a mapping"
+        );
+
+        // Same Ygg port with a different local target is a conflict.
+        let conflict = format!("{port}:127.0.0.1:{}", free_port());
+        assert!(
+            matches!(y.add_remote_tcp(conflict), Err(YggstackError::Config(_))),
+            "different local target on the same Ygg port must fail"
+        );
+        assert_eq!(
+            y.remote_tcp.lock().unwrap().len(),
+            1,
+            "conflict must not be stored"
+        );
+        y.stop();
+    }
+
+    #[test]
+    fn remote_udp_mapping_rejects_duplicate_and_conflict() {
+        let (y, _) = started_node();
+        let port = free_port();
+        let spec = format!("{port}:127.0.0.1:{port}");
+
+        y.add_remote_udp(spec.clone()).expect("first expose");
+        assert_eq!(y.remote_udp.lock().unwrap().len(), 1);
+        y.add_remote_udp(spec).expect("duplicate must be idempotent");
+        assert_eq!(
+            y.remote_udp.lock().unwrap().len(),
+            1,
+            "duplicate add must not append a UDP mapping"
+        );
+
+        let conflict = format!("{port}:127.0.0.1:{}", free_port());
+        assert!(
+            matches!(y.add_remote_udp(conflict), Err(YggstackError::Config(_))),
+            "different local target on the same UDP port must fail"
+        );
+        y.stop();
+    }
+
+    #[test]
+    fn remote_mapping_rejects_port_zero() {
+        let y = YggstackMobile::new();
+        assert!(matches!(
+            y.add_remote_tcp("0:127.0.0.1:1".to_string()),
+            Err(YggstackError::Config(_))
+        ));
+        assert!(matches!(
+            y.add_remote_udp("0:127.0.0.1:1".to_string()),
+            Err(YggstackError::Config(_))
+        ));
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        listener.local_addr().unwrap().port()
     }
 
     #[test]
