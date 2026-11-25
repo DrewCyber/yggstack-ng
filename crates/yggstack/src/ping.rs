@@ -111,10 +111,8 @@ pub async fn run_ping<S, F>(
         let started = Instant::now();
         let mut rtt = None;
         let mut stopped = false;
-        'recv: loop {
-            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-                break; // probe timed out
-            };
+        // checked_sub returning None means the probe budget is exhausted.
+        'recv: while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
             let reply = tokio::select! {
                 () = &mut stop => {
                     stopped = true;

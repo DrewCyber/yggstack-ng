@@ -37,7 +37,7 @@ impl ListenerStats {
 
     pub fn conn_closed(&self) {
         // Clamp at zero so a late close after a forced stop cannot wrap around.
-        self.active.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        self.active.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             if v > 0 { Some(v - 1) } else { None }
         }).ok();
     }
